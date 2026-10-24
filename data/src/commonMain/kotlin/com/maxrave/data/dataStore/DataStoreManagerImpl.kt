@@ -27,8 +27,6 @@ import com.maxrave.domain.manager.DataStoreManager.Values.TRUE
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
-import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -39,12 +37,6 @@ import com.maxrave.common.QUALITY as COMMON_QUALITY
 internal class DataStoreManagerImpl(
     private val settingsDataStore: DataStore<Preferences>,
 ) : DataStoreManager {
-    // Every reader (including the first network request) sees the migrated snapshot.
-    private val regionalData = flow {
-        settingsDataStore.edit { migrateRegionalPreferences(it) }
-        emitAll(settingsDataStore.data)
-    }
-
     override val appVersion: Flow<String> =
         settingsDataStore.data.map { preferences ->
             preferences[APP_VERSION] ?: ""
@@ -88,14 +80,13 @@ internal class DataStoreManagerImpl(
     }
 
     override val location: Flow<String> =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[LOCATION] ?: "CO"
         }
 
     override suspend fun setLocation(location: String) {
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
-                migrateRegionalPreferences(settings)
                 if (settings[LOCATION] != location) {
                     clearRegionalCache(settings)
                 }
@@ -106,7 +97,7 @@ internal class DataStoreManagerImpl(
     }
 
     override val moodAndGenresCache: Flow<String?> =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[MOOD_AND_GENRES_CACHE]
         }
 
@@ -119,7 +110,7 @@ internal class DataStoreManagerImpl(
     }
 
     override val moodArtworkCache: Flow<String?> =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[MOOD_ARTWORK_CACHE]
         }
 
@@ -189,12 +180,12 @@ internal class DataStoreManagerImpl(
     }
 
     override val language: Flow<String> =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[stringPreferencesKey(SELECTED_LANGUAGE)] ?: "es-ES"
         }
 
     override fun getString(key: String): Flow<String?> =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[stringPreferencesKey(key)]
         }
 
@@ -209,7 +200,6 @@ internal class DataStoreManagerImpl(
         // promos block was saved from the main-thread service scope as playback started.
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
-                if (key == SELECTED_LANGUAGE) migrateRegionalPreferences(settings)
                 if (key == SELECTED_LANGUAGE && settings[stringPreferencesKey(key)] != value) {
                     clearRegionalCache(settings)
                 }
@@ -1306,7 +1296,7 @@ internal class DataStoreManagerImpl(
     }
 
     override val visitorData =
-        regionalData.map { preferences ->
+        settingsDataStore.data.map { preferences ->
             preferences[VISITOR_DATA] ?: ""
         }
 

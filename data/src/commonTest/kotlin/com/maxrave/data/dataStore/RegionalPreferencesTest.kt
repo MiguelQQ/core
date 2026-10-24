@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -22,10 +23,15 @@ class RegionalPreferencesTest {
     private val artwork = stringPreferencesKey("mood_artwork_cache")
 
     @Test fun freshInstallUsesColombiaAndSpanish() = runBlocking {
-        val manager = DataStoreManagerImpl(MemoryPreferences())
-        assertEquals("CO", manager.location.first())
-        assertEquals("CO", manager.chartKey.first())
-        assertEquals("es-ES", manager.language.first())
+        val migration = RegionalPreferencesMigration()
+        val initial = mutablePreferencesOf()
+        assertTrue(migration.shouldMigrate(initial))
+        val migrated = migration.migrate(initial)
+        assertEquals("CO", migrated[location])
+        assertEquals("CO", migrated[chart])
+        assertEquals("es-ES", migrated[language])
+        assertFalse(migration.shouldMigrate(migrated))
+        assertNull(initial[REGION_MIGRATED_V076])
     }
 
     @Test fun legacyRegionsMigrateAndInvalidateCachedDiscovery() {
@@ -62,7 +68,6 @@ class RegionalPreferencesTest {
     @Test fun changingRegionClearsCachesAndKeepsChartsInSync() = runBlocking {
         val store = MemoryPreferences()
         val manager = DataStoreManagerImpl(store)
-        manager.location.first() // finish the one-time migration
         manager.setVisitorData("old")
         manager.setMoodAndGenresCache("old")
         manager.setMoodArtworkCache("old")
@@ -86,7 +91,8 @@ class RegionalPreferencesTest {
     }
 
     private class MemoryPreferences : DataStore<Preferences> {
-        override val data = MutableStateFlow<Preferences>(mutablePreferencesOf())
+        // This fake represents the snapshot after DataStore's initialization migrations.
+        override val data = MutableStateFlow<Preferences>(mutablePreferencesOf().apply { migrateRegionalPreferences(this) })
         override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences =
             transform(data.value).also { data.value = it }
     }

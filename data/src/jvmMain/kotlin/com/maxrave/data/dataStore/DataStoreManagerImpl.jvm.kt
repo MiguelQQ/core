@@ -17,6 +17,7 @@ import java.io.File
 
 actual fun createDataStoreInstance(): DataStore<Preferences> =
     PreferenceDataStoreFactory.create(
+        migrations = listOf(RegionalPreferencesMigration()),
         storage =
             ReadsWaitForWritesStorage(
                 FileStorage(PreferencesFileSerializer) {
