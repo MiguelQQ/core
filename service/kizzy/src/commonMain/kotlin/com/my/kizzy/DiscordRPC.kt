@@ -34,8 +34,8 @@ class DiscordRPC(
             smallText = song.artistName?.firstOrNull(),
             buttons =
                 listOf(
-                    "Listen on SimpMusic" to "https://simpmusic.org/app/watch?v=${song.videoId}",
-                    "Visit SimpMusic" to "https://github.com/maxrave-dev/SimpMusic",
+                    "Listen on Killmon Music" to "https://simpmusic.org/app/watch?v=${song.videoId}",
+                    "Visit Killmon Music" to "https://github.com/maxrave-dev/SimpMusic",
                 ),
             type = Type.LISTENING,
             since = currentTime,
