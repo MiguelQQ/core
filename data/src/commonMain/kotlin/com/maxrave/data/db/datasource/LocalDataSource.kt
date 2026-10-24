@@ -19,6 +19,7 @@ import com.maxrave.domain.data.entities.PairSongLocalPlaylist
 import com.maxrave.domain.data.entities.PlaylistEntity
 import com.maxrave.domain.data.entities.PodcastsEntity
 import com.maxrave.domain.data.entities.QueueEntity
+import com.maxrave.domain.data.entities.RecentSearchItem
 import com.maxrave.domain.data.entities.SearchHistory
 import com.maxrave.domain.data.entities.SetVideoIdEntity
 import com.maxrave.domain.data.entities.SongEntity
@@ -64,6 +65,16 @@ internal class LocalDataSource(
     suspend fun deleteSearchHistory() = databaseDao.deleteSearchHistory()
 
     suspend fun insertSearchHistory(searchHistory: SearchHistory) = databaseDao.insertSearchHistory(searchHistory)
+
+    suspend fun getRecentSearchItems(limit: Int) = databaseDao.getRecentSearchItems(limit)
+
+    suspend fun upsertRecentSearchItem(item: RecentSearchItem) = databaseDao.upsertRecentSearchItem(item)
+
+    suspend fun deleteRecentSearchItem(id: String) = databaseDao.deleteRecentSearchItem(id)
+
+    suspend fun deleteAllRecentSearchItems() = databaseDao.deleteAllRecentSearchItems()
+
+    suspend fun trimRecentSearchItems(limit: Int) = databaseDao.trimRecentSearchItems(limit)
 
     suspend fun getAllSongs(limit: Int) = databaseDao.getAllSongs(limit)
 

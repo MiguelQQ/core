@@ -25,6 +25,7 @@ import com.maxrave.domain.data.entities.PlaylistEntity
 import com.maxrave.domain.data.entities.PodcastWithEpisodes
 import com.maxrave.domain.data.entities.PodcastsEntity
 import com.maxrave.domain.data.entities.QueueEntity
+import com.maxrave.domain.data.entities.RecentSearchItem
 import com.maxrave.domain.data.entities.SearchHistory
 import com.maxrave.domain.data.entities.SetVideoIdEntity
 import com.maxrave.domain.data.entities.SongEntity
@@ -218,6 +219,24 @@ interface DatabaseDao {
 
     @Insert(onConflict = OnConflictStrategy.Companion.REPLACE)
     suspend fun insertSearchHistory(searchHistory: SearchHistory): Long
+
+    @Query("SELECT * FROM recent_search_item ORDER BY updatedAt DESC LIMIT :limit")
+    suspend fun getRecentSearchItems(limit: Int): List<RecentSearchItem>
+
+    @Insert(onConflict = OnConflictStrategy.Companion.REPLACE)
+    suspend fun upsertRecentSearchItem(item: RecentSearchItem)
+
+    @Query("DELETE FROM recent_search_item WHERE id = :id")
+    suspend fun deleteRecentSearchItem(id: String)
+
+    @Query("DELETE FROM recent_search_item")
+    suspend fun deleteAllRecentSearchItems()
+
+    @Query(
+        "DELETE FROM recent_search_item WHERE id NOT IN (" +
+            "SELECT id FROM recent_search_item ORDER BY updatedAt DESC LIMIT :limit)",
+    )
+    suspend fun trimRecentSearchItems(limit: Int)
 
     // Song
     @Query("SELECT * FROM song ORDER BY inLibrary DESC LIMIT :limit OFFSET 0")

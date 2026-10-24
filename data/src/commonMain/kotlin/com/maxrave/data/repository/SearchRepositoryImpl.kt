@@ -8,6 +8,7 @@ import com.maxrave.data.parser.search.parseSearchArtist
 import com.maxrave.data.parser.search.parseSearchPlaylist
 import com.maxrave.data.parser.search.parseSearchSong
 import com.maxrave.data.parser.search.parseSearchVideo
+import com.maxrave.domain.data.entities.RecentSearchItem
 import com.maxrave.domain.data.entities.SearchHistory
 import com.maxrave.domain.data.model.searchResult.SearchSuggestions
 import com.maxrave.domain.data.model.searchResult.albums.AlbumsResult
@@ -24,6 +25,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import kotlin.time.Clock
+import kotlin.time.ExperimentalTime
 
 internal class SearchRepositoryImpl(
     private val localDataSource: LocalDataSource,
@@ -42,6 +45,30 @@ internal class SearchRepositoryImpl(
     override suspend fun deleteSearchHistory() =
         withContext(Dispatchers.IO) {
             localDataSource.deleteSearchHistory()
+        }
+
+    override fun getRecentSearches(): Flow<List<RecentSearchItem>> =
+        flow {
+            emit(localDataSource.getRecentSearchItems(RecentSearchItem.LIMIT))
+        }.flowOn(Dispatchers.IO)
+
+    @OptIn(ExperimentalTime::class)
+    override suspend fun upsertRecentSearch(item: RecentSearchItem) =
+        withContext(Dispatchers.IO) {
+            localDataSource.upsertRecentSearchItem(
+                item.copy(updatedAt = Clock.System.now().toEpochMilliseconds()),
+            )
+            localDataSource.trimRecentSearchItems(RecentSearchItem.LIMIT)
+        }
+
+    override suspend fun deleteRecentSearch(id: String) =
+        withContext(Dispatchers.IO) {
+            localDataSource.deleteRecentSearchItem(id)
+        }
+
+    override suspend fun deleteAllRecentSearches() =
+        withContext(Dispatchers.IO) {
+            localDataSource.deleteAllRecentSearchItems()
         }
 
     override fun getSearchDataSong(query: String): Flow<Resource<ArrayList<SongsResult>>> =

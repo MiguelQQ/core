@@ -1,5 +1,6 @@
 package com.maxrave.domain.repository
 
+import com.maxrave.domain.data.entities.RecentSearchItem
 import com.maxrave.domain.data.entities.SearchHistory
 import com.maxrave.domain.data.model.searchResult.SearchSuggestions
 import com.maxrave.domain.data.model.searchResult.albums.AlbumsResult
@@ -16,6 +17,14 @@ interface SearchRepository {
     fun insertSearchHistory(searchHistory: SearchHistory): Flow<Long>
 
     suspend fun deleteSearchHistory()
+
+    fun getRecentSearches(): Flow<List<RecentSearchItem>>
+
+    suspend fun upsertRecentSearch(item: RecentSearchItem)
+
+    suspend fun deleteRecentSearch(id: String)
+
+    suspend fun deleteAllRecentSearches()
 
     fun getSearchDataSong(query: String): Flow<Resource<ArrayList<SongsResult>>>
 

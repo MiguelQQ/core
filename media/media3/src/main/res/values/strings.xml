@@ -7,7 +7,12 @@
     <string name="repeat_all">Repeat All</string>
     <string name="repeat_off">Repeat Off</string>
     <string name="shuffle">Shuffle</string>
-    <string name="notification_channel_name" translatable="false">Killmon Music Playback Notification</string>
+    <string name="notification_channel_name">Killmon Music Playback Notification</string>
+    <string name="queue">Queue</string>
+    <string name="queue_empty">Queue is empty</string>
+    <string name="nothing_to_show">Nothing to show</string>
+    <string name="search_songs">Search songs</string>
+    <string name="no_results">No results</string>
     <string name="home">Home</string>
     <string name="search">Search</string>
     <string name="library">Library</string>

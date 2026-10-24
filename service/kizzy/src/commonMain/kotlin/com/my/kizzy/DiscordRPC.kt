@@ -28,8 +28,11 @@ class DiscordRPC(
             name = APP_NAME,
             details = song.title,
             state = song.artistName?.joinToString(", "),
-            largeImage = song.thumbnails?.let { RpcImage.ExternalImage(it) },
-            smallImage = RpcImage.ExternalImage(APP_ICON),
+            largeImage =
+                song.thumbnails?.let {
+                    RpcImage.ExternalImage(it, fallbackDiscordAsset = APP_ICON)
+                } ?: RpcImage.DiscordImage(APP_ICON),
+            smallImage = RpcImage.DiscordImage(APP_ICON),
             largeText = song.albumName,
             smallText = song.artistName?.firstOrNull(),
             type = Type.LISTENING,
@@ -41,9 +44,9 @@ class DiscordRPC(
     }
 
     companion object {
-        private const val APPLICATION_ID = "1271273225120125040"
+        private const val APPLICATION_ID = "1563405206408929401"
         private const val APP_NAME: String = "Killmon Music"
-        private const val APP_ICON: String =
-            "https://fra.cloud.appwrite.io/v1/storage/buckets/683f1f620010ba0fa5b1/files/69007bc8001a28a7cea8/view?project=67ec0369002bd8a96885"
+        /** Discord developer-portal asset on the Killmon application. */
+        private const val APP_ICON: String = "killmon_icon"
     }
 }
