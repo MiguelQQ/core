@@ -717,20 +717,14 @@ class Ytmusic {
             parameter("service", "YouTube")
         }
 
-    suspend fun checkForGithubReleaseUpdate() =
-        httpClient.get("https://api.github.com/repos/maxrave-dev/SimpMusic/releases/latest") {
-            contentType(ContentType.Application.Json)
-        }
+    suspend fun checkForGithubReleaseUpdate(): Nothing =
+        error("In-app update checks are disabled")
 
-    suspend fun checkForFdroidUpdate() =
-        httpClient.get("https://f-droid.org/api/v1/packages/com.maxrave.simpmusic") {
-            contentType(ContentType.Application.Json)
-        }
+    suspend fun checkForFdroidUpdate(): Nothing =
+        error("In-app update checks are disabled")
 
-    suspend fun fdroidMetadata() =
-        httpClient.get(
-            "https://raw.githubusercontent.com/f-droid/fdroiddata/master/metadata/com.maxrave.simpmusic.yml",
-        )
+    suspend fun fdroidMetadata(): Nothing =
+        error("Upstream signing-key lookup is disabled")
 
     suspend fun playlist(playlistId: String) =
         httpClient.post("browse") {

@@ -904,25 +904,17 @@ class YouTube {
         }
 
     suspend fun checkForGithubReleaseUpdate(): Result<GithubResponse> =
-        runCatching {
-            ytMusic.checkForGithubReleaseUpdate().body<GithubResponse>()
-        }
+        Result.failure(IllegalStateException("In-app update checks are disabled"))
 
     suspend fun checkForFdroidUpdate(): Result<FdroidResponse> =
-        runCatching {
-            ytMusic.checkForFdroidUpdate().body<FdroidResponse>()
-        }
+        Result.failure(IllegalStateException("In-app update checks are disabled"))
 
     /**
      * SHA-256 of our release signing certificates: F-Droid ships the APK we sign, so it pins our keys.
      * The field is either one inline value or a YAML list (`- <hex>` per line), e.g. after a key rotation.
      */
     suspend fun getFdroidSigningKeys(): Result<List<String>> =
-        runCatching {
-            val metadata = ytMusic.fdroidMetadata().bodyAsText()
-            val field = checkNotNull(Regex("""AllowedAPKSigningKeys:((?:\s*-?\s*[0-9a-f]{64})+)""").find(metadata)).groupValues[1]
-            Regex("[0-9a-f]{64}").findAll(field).map { it.value }.toList()
-        }
+        Result.failure(IllegalStateException("Upstream signing-key lookup is disabled"))
 
     suspend fun newRelease(): Result<ExplorePage> =
         runCatching {
