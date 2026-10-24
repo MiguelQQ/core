@@ -20,6 +20,17 @@ class LyricsMatchTest {
     }
 
     @Test
+    fun shared_artist_words_and_song_title_substrings_are_not_identity() {
+        assertFalse(lyricsArtistMatches("Lil Wayne", "Lil Nas X"))
+        assertFalse(lyricsArtistMatches("Los Tigres del Norte", "Los Angeles Azules"))
+        assertTrue(lyricsArtistMatches("Blessd feat. Ryan Castro", "Ryan Castro"))
+        assertFalse(lyricsTitleMatches("Palabras Sobran", "Palabras Sobran Remix"))
+        assertFalse(lyricsTitleMatches("Palabras Sobran", "Palabras Sobran Parte 2"))
+        assertFalse(lyricsTitleMatches("Palabras Sobran", null))
+        assertFalse(lyricsArtistMatches("Blessd", null))
+    }
+
+    @Test
     fun duration_rejects_anything_further_than_four_seconds() {
         assertTrue(lyricsDurationMatches(216, 220))
         assertFalse(lyricsDurationMatches(216, 221))

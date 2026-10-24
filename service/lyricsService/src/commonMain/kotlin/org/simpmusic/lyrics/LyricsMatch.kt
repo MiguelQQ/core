@@ -37,17 +37,10 @@ fun lyricsTitleMatches(
     val right = normalizeLyricsTitle(candidate)
     if (left.isEmpty() || right.isEmpty()) return false
     if (left == right) return true
-    // "BLESSD - Palabras Sobran (Official Video)" against "Palabras Sobran". A single short
-    // word is not enough: "Palabras" must not accept "Palabras Sobran".
-    val shorter = if (left.length <= right.length) left else right
-    val longer = if (left.length <= right.length) right else left
-    val shortTokens = shorter.split(" ")
-    if (shortTokens.size < 2 && shorter.length < 10) return false
-    val longTokens = longer.split(" ")
-    if (shortTokens.size > longTokens.size) return false
-    return (0..longTokens.size - shortTokens.size).any { start ->
-        longTokens.subList(start, start + shortTokens.size) == shortTokens
-    }
+    // Only an explicit artist/title separator may add a prefix. Substring matching
+    // also accepted "Palabras Sobran Remix" or "Palabras Sobran Parte 2".
+    return expected.split(" - ").drop(1).any { normalizeLyricsTitle(it) == right } ||
+        candidate.split(" - ").drop(1).any { normalizeLyricsTitle(it) == left }
 }
 
 fun lyricsArtistMatches(
@@ -59,10 +52,14 @@ fun lyricsArtistMatches(
     val right = normalizeLyricsField(candidate)
     if (left.isEmpty() || right.isEmpty()) return false
     if (left == right) return true
-    val leftTokens = left.split(" ").filter { it.length >= 3 }.toSet()
-    val rightTokens = right.split(" ").filter { it.length >= 3 }.toSet()
-    if (leftTokens.isEmpty() || rightTokens.isEmpty()) return false
-    return leftTokens.any { it in rightTokens }
+    // Compare complete artist credits. One shared token ("Lil", "Los", "Young")
+    // does not identify an artist.
+    fun credits(value: String): Set<String> =
+        value.split(Regex("\\s*(?:,|&|;| feat\\.? | ft\\.? | featuring | x )\\s*", RegexOption.IGNORE_CASE))
+            .map(::normalizeLyricsField)
+            .filter { it.isNotEmpty() }
+            .toSet()
+    return credits(expected).intersect(credits(candidate)).isNotEmpty()
 }
 
 /**
