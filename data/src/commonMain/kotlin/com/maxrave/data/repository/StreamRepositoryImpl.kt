@@ -170,7 +170,12 @@ internal class StreamRepositoryImpl(
                     val audioTwinItag = ITAG.highQualityTwinOf(itag)
                     val audioFormat =
                         formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
+                            // 256 kbps arrives as Opus or as AAC. If the account has neither, the
+                            // highest audio that did arrive is what that choice can actually play.
                             formatList.find { it.itag == audioTwinItag }
+                                ?: formatList
+                                    .filter { it.isAudio && !it.url.isNullOrEmpty() }
+                                    .maxByOrNull { it.bitrate }
                         } else {
                             formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
                         }

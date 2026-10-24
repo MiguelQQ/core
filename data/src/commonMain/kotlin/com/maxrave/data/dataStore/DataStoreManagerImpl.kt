@@ -137,7 +137,8 @@ internal class DataStoreManagerImpl(
 
     override val quality: Flow<String> =
         settingsDataStore.data.map { preferences ->
-            preferences[QUALITY] ?: COMMON_QUALITY.items[0].toString()
+            // A missing key is a fresh install. A saved label, including Low, is left as stored.
+            preferences[QUALITY] ?: COMMON_QUALITY.defaultLabel
         }
 
     override suspend fun setQuality(quality: String) {
@@ -150,7 +151,7 @@ internal class DataStoreManagerImpl(
 
     override val downloadQuality: Flow<String> =
         settingsDataStore.data.map { preferences ->
-            preferences[DOWNLOAD_QUALITY] ?: COMMON_QUALITY.items[0].toString()
+            preferences[DOWNLOAD_QUALITY] ?: COMMON_QUALITY.defaultLabel
         }
 
     override suspend fun setDownloadQuality(quality: String) {

@@ -334,6 +334,17 @@ object QUALITY {
         )
 
     /**
+     * What a fresh install plays and downloads until the user picks a label.
+     *
+     * Opus 256 kbps is the high tier (the old plain "High"). AAC 256 kbps is the same bitrate in
+     * the other family, not a higher one; the player asks for it only when Opus is absent. A
+     * missing preference is not a stored choice, so callers use this only as the fallback when the
+     * key was never written.
+     */
+    val defaultLabel: String
+        get() = items[2].toString()
+
+    /**
      * Labels written by older builds, mapped to the item that replaced them.
      *
      * The setting is persisted as the label STRING, not as an index, so renaming an entry orphans
