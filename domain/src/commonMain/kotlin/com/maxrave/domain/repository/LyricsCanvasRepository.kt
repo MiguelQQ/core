@@ -58,6 +58,8 @@ interface LyricsCanvasRepository {
         dataStoreManager: DataStoreManager,
         query: String,
         duration: Int?,
+        title: String? = null,
+        artist: String? = null,
     ): Flow<Resource<Lyrics>>
 
     fun getLrclibLyricsData(
@@ -86,7 +88,12 @@ interface LyricsCanvasRepository {
         targetLanguage: String,
     ): Flow<Resource<Lyrics>>
 
-    fun getSimpMusicLyrics(videoId: String): Flow<Resource<Lyrics>>
+    fun getSimpMusicLyrics(
+        videoId: String,
+        title: String? = null,
+        artist: String? = null,
+        durationSeconds: Int? = null,
+    ): Flow<Resource<Lyrics>>
 
     fun getSimpMusicTranslatedLyrics(
         videoId: String,
