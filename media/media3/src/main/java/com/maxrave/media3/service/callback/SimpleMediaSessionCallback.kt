@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.annotation.DrawableRes
 import androidx.core.net.toUri
+import androidx.media.utils.MediaConstants
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -30,6 +31,7 @@ import com.maxrave.common.MEDIA_CUSTOM_COMMAND
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.home.HomeItem
+import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
 import com.maxrave.domain.mediaservice.handler.PlayerEvent
 import com.maxrave.domain.mediaservice.handler.PlaylistType
@@ -244,9 +246,13 @@ internal class SimpleMediaSessionCallback(
                             .setIsPlayable(false)
                             .setIsBrowsable(false)
                             .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                            .setExtras(folderStyleExtras())
                             .build(),
                     ).build(),
-                params,
+                MediaLibraryService.LibraryParams
+                    .Builder()
+                    .setExtras(rootBrowseExtras())
+                    .build(),
             ),
         )
 
@@ -307,17 +313,10 @@ internal class SimpleMediaSessionCallback(
         params: MediaLibraryService.LibraryParams?,
     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
         scope.future(Dispatchers.IO) {
-            val rootExtras =
-                Bundle().apply {
-                    putBoolean(
-                        MEDIA_SEARCH_SUPPORTED,
-                        true,
-                    )
-                }
             val libraryParams =
                 MediaLibraryService.LibraryParams
                     .Builder()
-                    .setExtras(rootExtras)
+                    .setExtras(rootBrowseExtras())
                     .build()
             return@future LibraryResult.ofItemList(
                 when (parentId) {
@@ -394,7 +393,7 @@ internal class SimpleMediaSessionCallback(
                                     "$PLAYLIST/${it.id}",
                                     it.title,
                                     "${it.tracks?.size ?: 0} ${context.getString(R.string.track)}",
-                                    it.thumbnail?.toUri(),
+                                    it.thumbnail?.toLargeArtworkUrl()?.toUri(),
                                     MediaMetadata.MEDIA_TYPE_PLAYLIST,
                                 )
                             }
@@ -430,7 +429,7 @@ internal class SimpleMediaSessionCallback(
                                 "$HOME/${it.title}",
                                 it.title,
                                 it.subtitle,
-                                null,
+                                it.shelfArtwork(),
                                 MediaMetadata.MEDIA_TYPE_FOLDER_MIXED,
                             )
                         }
@@ -453,11 +452,7 @@ internal class SimpleMediaSessionCallback(
                                                     id = "$HOME/${homeItem.title}/$PLAYLIST/${it.playlistId}",
                                                     title = it.title,
                                                     subtitle = it.description,
-                                                    iconUri =
-                                                        it.thumbnails
-                                                            .lastOrNull()
-                                                            ?.url
-                                                            ?.toUri(),
+                                                    iconUri = it.thumbnails.largestArtwork(),
                                                     mediaType = MediaMetadata.MEDIA_TYPE_PLAYLIST,
                                                 )
                                             } else if (it?.videoId != null) {
@@ -800,6 +795,33 @@ internal class SimpleMediaSessionCallback(
         .appendPath(context.resources.getResourceEntryName(id))
         .build()
 
+    /**
+     * Grid (2) for browsable and playable children. Media3 copies [MediaMetadata.extras]
+     * onto the legacy description Android Auto reads.
+     *
+     * [androidx.media.utils.MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE]
+     * clusters siblings under one header. Each folder here is already one block, so a
+     * hint would paint a second title above the tile and is not set.
+     */
+    private fun folderStyleExtras(): Bundle =
+        Bundle().apply {
+            putInt(
+                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+                MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
+            )
+            putInt(
+                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+                MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
+            )
+        }
+
+    private fun rootBrowseExtras(): Bundle =
+        folderStyleExtras().apply {
+            putBoolean(MEDIA_SEARCH_SUPPORTED, true)
+            putBoolean(CONTENT_STYLE_SUPPORTED, true)
+            putInt(MediaConstants.BROWSER_ROOT_HINTS_KEY_MEDIA_ART_SIZE_PIXELS, LARGE_ART_PX)
+        }
+
     private fun browsableMediaItem(
         id: String,
         title: String,
@@ -815,10 +837,11 @@ internal class SimpleMediaSessionCallback(
                 .setTitle(title)
                 .setSubtitle(subtitle)
                 .setArtist(subtitle)
-                .setArtworkUri(iconUri)
+                .setArtworkUri(iconUri.largeIfRemote())
                 .setIsPlayable(false)
                 .setIsBrowsable(true)
                 .setMediaType(mediaType)
+                .setExtras(folderStyleExtras())
                 .build(),
         ).build()
 
@@ -832,7 +855,7 @@ internal class SimpleMediaSessionCallback(
                     .setTitle(this.title)
                     .setSubtitle(this.artistName?.joinToString(", "))
                     .setArtist(this.artistName?.joinToString(" "))
-                    .setArtworkUri(this.thumbnails?.toUri())
+                    .setArtworkUri(this.thumbnails?.toLargeArtworkUrl()?.toUri())
                     .setIsPlayable(true)
                     .setIsBrowsable(false)
                     .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
@@ -849,16 +872,31 @@ internal class SimpleMediaSessionCallback(
                     .setTitle(this.title)
                     .setSubtitle(this.artists?.toListName()?.connectArtists())
                     .setArtist(this.artists?.toListName()?.connectArtists())
-                    .setArtworkUri(
-                        this.thumbnails
-                            ?.lastOrNull()
-                            ?.url
-                            ?.toUri(),
-                    ).setIsPlayable(true)
+                    .setArtworkUri(this.thumbnails.largestArtwork())
+                    .setIsPlayable(true)
                     .setIsBrowsable(false)
                     .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
                     .build(),
             ).build()
+
+    /** Cover for a Home shelf tile: the first item's largest image, then the shelf header. */
+    private fun HomeItem.shelfArtwork(): Uri? {
+        val fromContents =
+            contents.firstNotNullOfOrNull { content ->
+                content?.thumbnails?.largestUrl()
+            }
+        return (fromContents ?: thumbnail?.largestUrl())?.toLargeArtworkUrl()?.toUri()
+    }
+
+    private fun List<Thumbnail>?.largestArtwork(): Uri? = this?.largestUrl()?.toLargeArtworkUrl()?.toUri()
+
+    private fun List<Thumbnail>.largestUrl(): String? = maxByOrNull { it.width * it.height }?.url
+
+    private fun Uri?.largeIfRemote(): Uri? {
+        if (this == null) return null
+        val raw = toString()
+        return if (scheme == "http" || scheme == "https") raw.toLargeArtworkUrl().toUri() else this
+    }
 
     companion object {
         const val ROOT = "root"
@@ -869,5 +907,7 @@ internal class SimpleMediaSessionCallback(
         const val FAVORITE = "favorite"
         const val DOWNLOADED = "downloaded"
         const val MEDIA_SEARCH_SUPPORTED = "android.media.browse.SEARCH_SUPPORTED"
+        const val CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
+        const val LARGE_ART_PX = 512
     }
 }
