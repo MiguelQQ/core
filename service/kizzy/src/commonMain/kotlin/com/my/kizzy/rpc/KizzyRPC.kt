@@ -126,7 +126,7 @@ open class KizzyRPC(
                                 ),
                             buttons = buttons?.map { it.first },
                             metadata = Metadata(buttonUrls = buttons?.map { it.second }),
-                            applicationId = applicationId.takeIf { !buttons.isNullOrEmpty() },
+                            applicationId = applicationId,
                             url = streamUrl,
                         ),
                     ),

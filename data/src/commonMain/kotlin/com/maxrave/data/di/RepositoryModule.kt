@@ -3,6 +3,9 @@ package com.maxrave.data.di
 import com.maxrave.common.AppIdentity
 import com.maxrave.common.Config.SERVICE_SCOPE
 import com.maxrave.data.io.fileDir
+import com.maxrave.data.killmon.KillmonAccountRepositoryImpl
+import com.maxrave.data.killmon.KillmonApi
+import com.maxrave.data.killmon.createKillmonTokenStore
 import com.maxrave.data.repository.AccountRepositoryImpl
 import com.maxrave.data.repository.AlbumRepositoryImpl
 import com.maxrave.data.repository.AnalyticsRepositoryImpl
@@ -22,6 +25,7 @@ import com.maxrave.data.repository.StreamRepositoryImpl
 import com.maxrave.data.repository.TasteRepositoryImpl
 import com.maxrave.data.repository.UpdateRepositoryImpl
 import com.maxrave.domain.repository.AccountRepository
+import com.maxrave.domain.repository.KillmonAccountRepository
 import com.maxrave.domain.repository.AlbumRepository
 import com.maxrave.domain.repository.AnalyticsRepository
 import com.maxrave.domain.repository.ArtistRepository
@@ -46,6 +50,10 @@ val repositoryModule =
     module {
         single<AccountRepository>(createdAtStart = true) {
             AccountRepositoryImpl(get(), get())
+        }
+
+        single<KillmonAccountRepository>(createdAtStart = true) {
+            KillmonAccountRepositoryImpl(get(), createKillmonTokenStore(), KillmonApi()).also { it.start() }
         }
 
         single<AlbumRepository>(createdAtStart = true) {

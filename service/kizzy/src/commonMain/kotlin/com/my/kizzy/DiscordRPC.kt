@@ -30,9 +30,9 @@ class DiscordRPC(
             state = song.artistName?.joinToString(", "),
             largeImage =
                 song.thumbnails?.let {
-                    RpcImage.ExternalImage(it, fallbackDiscordAsset = APP_ICON)
-                } ?: RpcImage.DiscordImage(APP_ICON),
-            smallImage = RpcImage.DiscordImage(APP_ICON),
+                    RpcImage.ExternalImage(it, fallbackDiscordAsset = APP_ICON_URL)
+                } ?: RpcImage.ExternalImage(APP_ICON_URL),
+            smallImage = RpcImage.ExternalImage(APP_ICON_URL),
             largeText = song.albumName,
             smallText = song.artistName?.firstOrNull(),
             type = Type.LISTENING,
@@ -46,7 +46,12 @@ class DiscordRPC(
     companion object {
         private const val APPLICATION_ID = "1563405206408929401"
         private const val APP_NAME: String = "Killmon Music"
-        /** Discord developer-portal asset on the Killmon application. */
-        private const val APP_ICON: String = "killmon_icon"
+
+        /**
+         * Public app icon. User-token gateway presence cannot resolve developer-portal asset
+         * keys (`mp:killmon_icon`); external-assets turns this URL into `mp:external/...`.
+         */
+        const val APP_ICON_URL =
+            "https://raw.githubusercontent.com/MiguelQQ/SimpMusic/killmon/androidApp/src/main/res/drawable/app_icon.png"
     }
 }

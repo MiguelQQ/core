@@ -29,12 +29,23 @@ sealed class RpcImage {
         private val fallbackDiscordAsset: String? = null,
     ) : RpcImage() {
         override suspend fun resolveImage(resolveExternalImage: suspend (String) -> String?): String? {
-            val asset = ArtworkCache.getOrFetch(image) { resolveExternalImage(image) }
-            return when {
-                asset != null -> if (asset.startsWith("http") || asset.startsWith("mp:")) asset else "mp:$asset"
-                image.startsWith("http") -> image // Raw URL
-                else -> fallbackDiscordAsset?.let { if (it.startsWith("http")) it else "mp:${it}" }
+            resolveOne(image, resolveExternalImage)?.let { return it }
+            val fallback = fallbackDiscordAsset ?: return null
+            if (fallback == image) return null
+            // An http fallback is an external URL, same as the primary image: "mp:" is only valid
+            // for a media-proxy path returned by external-assets, so it has to be resolved too.
+            return resolveOne(fallback, resolveExternalImage)
+        }
+
+        private suspend fun resolveOne(
+            url: String,
+            resolveExternalImage: suspend (String) -> String?,
+        ): String? {
+            if (!url.startsWith("http")) {
+                return if (url.startsWith("mp:")) url else "mp:$url"
             }
+            val asset = ArtworkCache.getOrFetch(url) { resolveExternalImage(url) } ?: return null
+            return if (asset.startsWith("http") || asset.startsWith("mp:")) asset else "mp:$asset"
         }
     }
 }

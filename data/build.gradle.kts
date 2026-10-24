@@ -101,6 +101,11 @@ kotlin {
 
                 // Koin
                 implementation(libs.koin.core)
+
+                implementation(projects.ktorExt)
+                implementation(libs.ktor.client.core)
+                implementation(libs.ktor.client.content.negotiation)
+                implementation(libs.ktor.serialization.kotlinx.json)
             }
         }
 
@@ -116,6 +121,8 @@ kotlin {
                 // commonMain by default and will correctly pull the Android artifacts of any KMP
                 // dependencies declared in commonMain.
                 implementation(libs.koin.android)
+                implementation(libs.appcompat)
+                implementation(libs.security.crypto)
                 implementation(projects.media3)
                 implementation(libs.room.ktx)
                 // Login sync: the phone sends sign-ins to the Desktop
