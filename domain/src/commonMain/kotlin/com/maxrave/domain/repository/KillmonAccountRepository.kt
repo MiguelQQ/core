@@ -5,10 +5,13 @@ import com.maxrave.domain.data.model.killmon.KillmonSession
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Optional Killmon account. The app stays usable when [session] is null; nothing asks for a
- * login at startup.
+ * Killmon account. The app waits until [ready] is true before showing Home. A null [session]
+ * after that means the user must sign in.
  */
 interface KillmonAccountRepository {
+    /** False until the stored session has been read and, if present, checked once. */
+    val ready: StateFlow<Boolean>
+
     val session: StateFlow<KillmonSession?>
 
     suspend fun login(

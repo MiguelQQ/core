@@ -43,6 +43,9 @@ internal class KillmonAccountRepositoryImpl(
     private val prefsMutex = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
 
+    private val _ready = MutableStateFlow(false)
+    override val ready: StateFlow<Boolean> = _ready.asStateFlow()
+
     private val _session = MutableStateFlow<KillmonSession?>(null)
     override val session: StateFlow<KillmonSession?> = _session.asStateFlow()
 
@@ -54,12 +57,25 @@ internal class KillmonAccountRepositoryImpl(
         if (started) return
         started = true
         scope.launch {
-            publish(tokenStore.load())
-            if (_session.value != null) {
-                prefsMutex.withLock { syncLocked(justRegistered = false) }
-            } else {
-                baseline = readLocal()
-                acceptLocalEdits = true
+            try {
+                publish(tokenStore.load())
+                if (_session.value != null) {
+                    prefsMutex.withLock {
+                        try {
+                            syncLocked(justRegistered = false)
+                        } catch (e: Exception) {
+                            Logger.e(TAG, "No se pudo comprobar la sesión", e)
+                        }
+                    }
+                } else {
+                    baseline = readLocal()
+                    acceptLocalEdits = true
+                }
+            } catch (e: Exception) {
+                Logger.e(TAG, "No se pudo leer la sesión", e)
+                _session.value = null
+            } finally {
+                _ready.value = true
             }
             merge(
                 dataStore.language,
