@@ -27,6 +27,8 @@ import com.maxrave.domain.manager.DataStoreManager.Values.TRUE
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -37,6 +39,12 @@ import com.maxrave.common.QUALITY as COMMON_QUALITY
 internal class DataStoreManagerImpl(
     private val settingsDataStore: DataStore<Preferences>,
 ) : DataStoreManager {
+    // Every reader (including the first network request) sees the migrated snapshot.
+    private val regionalData = flow {
+        settingsDataStore.edit { migrateRegionalPreferences(it) }
+        emitAll(settingsDataStore.data)
+    }
+
     override val appVersion: Flow<String> =
         settingsDataStore.data.map { preferences ->
             preferences[APP_VERSION] ?: ""
@@ -80,20 +88,25 @@ internal class DataStoreManagerImpl(
     }
 
     override val location: Flow<String> =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[LOCATION] ?: "CO"
         }
 
     override suspend fun setLocation(location: String) {
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
+                migrateRegionalPreferences(settings)
+                if (settings[LOCATION] != location) {
+                    clearRegionalCache(settings)
+                }
                 settings[LOCATION] = location
+                settings[CHART_KEY] = location
             }
         }
     }
 
     override val moodAndGenresCache: Flow<String?> =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[MOOD_AND_GENRES_CACHE]
         }
 
@@ -106,7 +119,7 @@ internal class DataStoreManagerImpl(
     }
 
     override val moodArtworkCache: Flow<String?> =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[MOOD_ARTWORK_CACHE]
         }
 
@@ -176,12 +189,12 @@ internal class DataStoreManagerImpl(
     }
 
     override val language: Flow<String> =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[stringPreferencesKey(SELECTED_LANGUAGE)] ?: "es-ES"
         }
 
     override fun getString(key: String): Flow<String?> =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[stringPreferencesKey(key)]
         }
 
@@ -196,6 +209,10 @@ internal class DataStoreManagerImpl(
         // promos block was saved from the main-thread service scope as playback started.
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
+                if (key == SELECTED_LANGUAGE) migrateRegionalPreferences(settings)
+                if (key == SELECTED_LANGUAGE && settings[stringPreferencesKey(key)] != value) {
+                    clearRegionalCache(settings)
+                }
                 settings[stringPreferencesKey(key)] = value
             }
         }
@@ -925,18 +942,10 @@ internal class DataStoreManagerImpl(
         }
     }
 
-    override val chartKey =
-        settingsDataStore.data.map { preferences ->
-            preferences[CHART_KEY] ?: "ZZ"
-        }
+    // Charts and Home share the same country selection.
+    override val chartKey = location
 
-    override suspend fun setChartKey(key: String) {
-        withContext(Dispatchers.IO) {
-            settingsDataStore.edit { settings ->
-                settings[CHART_KEY] = key
-            }
-        }
-    }
+    override suspend fun setChartKey(key: String) = setLocation(key)
 
     override val themeMode =
         settingsDataStore.data.map { preferences ->
@@ -1297,7 +1306,7 @@ internal class DataStoreManagerImpl(
     }
 
     override val visitorData =
-        settingsDataStore.data.map { preferences ->
+        regionalData.map { preferences ->
             preferences[VISITOR_DATA] ?: ""
         }
 

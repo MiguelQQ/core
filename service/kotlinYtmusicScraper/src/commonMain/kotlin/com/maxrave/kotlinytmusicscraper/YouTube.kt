@@ -158,6 +158,10 @@ class YouTube {
     /**
      * Set the locale and language for YouTube Music
      */
+    var localeProvider: (suspend () -> YouTubeLocale)?
+        get() = ytMusic.localeProvider
+        set(value) { ytMusic.localeProvider = value }
+
     var locale: YouTubeLocale
         get() = ytMusic.locale
         set(value) {
