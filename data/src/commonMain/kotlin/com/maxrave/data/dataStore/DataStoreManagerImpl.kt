@@ -81,7 +81,7 @@ internal class DataStoreManagerImpl(
 
     override val location: Flow<String> =
         settingsDataStore.data.map { preferences ->
-            preferences[LOCATION] ?: "VN"
+            preferences[LOCATION] ?: "CO"
         }
 
     override suspend fun setLocation(location: String) {
@@ -176,7 +176,7 @@ internal class DataStoreManagerImpl(
 
     override val language: Flow<String> =
         settingsDataStore.data.map { preferences ->
-            preferences[stringPreferencesKey(SELECTED_LANGUAGE)] ?: SUPPORTED_LANGUAGE.codes.first()
+            preferences[stringPreferencesKey(SELECTED_LANGUAGE)] ?: "es-ES"
         }
 
     override fun getString(key: String): Flow<String?> =
