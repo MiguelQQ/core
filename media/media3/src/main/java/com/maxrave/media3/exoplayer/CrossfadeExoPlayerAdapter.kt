@@ -2898,6 +2898,9 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     companion object {
+        /** How early the next, already buffered track takes over when crossfade is not running. */
+        private const val GAPLESS_HANDOFF_MS = 120L
+        private const val GAPLESS_RESET_AFTER_MS = 1500L
         /** Floor for the shortest track worth crossfading, in ms. */
         private const val MIN_CROSSFADE_TRACK_MS = 20_000L
 
@@ -3067,6 +3070,7 @@ internal class CrossfadeExoPlayerAdapter(
                                         }
                                     }
                                 }
+                                maybeStartGaplessHandoff(player, pos, dur)
                             }
                         }
                     } catch (e: Exception) {
@@ -3076,6 +3080,41 @@ internal class CrossfadeExoPlayerAdapter(
                     delay(50) // Update every 50ms
                 }
             }
+    }
+
+    /**
+     * The track whose tail already handed over to the next one. The poll runs every 50 ms, so the
+     * hand-off must fire once per track, not once per tick until the swap lands.
+     */
+    private var gaplessHandoffFor: String? = null
+
+    /**
+     * Gapless playback without crossfade: waiting for STATE_ENDED costs the end-of-stream event,
+     * a hop to the coroutine scope and the swap before the next track makes a sound. When the next
+     * track's precached player is already READY, hand over for the last [GAPLESS_HANDOFF_MS]
+     * instead, so the swap lands on the track boundary. Anything not ready keeps the ordinary path
+     * (the ENDED event), so this can only ever make a transition earlier, never skip one.
+     */
+    private fun maybeStartGaplessHandoff(
+        player: ExoPlayer,
+        pos: Long,
+        dur: Long,
+    ) {
+        if (pos < GAPLESS_RESET_AFTER_MS) gaplessHandoffFor = null
+        if (isCrossfading || isCastActive || !player.isPlaying || dur <= 0 || pos <= 0) return
+        if (internalRepeatMode == PlayerConstants.REPEAT_MODE_ONE) return
+        val speed = internalPlaybackSpeed.coerceAtLeast(0.1f)
+        val remaining = ((dur - pos) / speed).toLong()
+        if (remaining !in 1..GAPLESS_HANDOFF_MS) return
+        val currentId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: return
+        if (gaplessHandoffFor == currentId || !hasNextMediaItem()) return
+        if (isCurrentTrackLive() || isNextTrackLive()) return
+        val nextId = playlist.getOrNull(getNextMediaItemIndex())?.mediaId ?: return
+        val ready = precachedPlayers[nextId]?.player ?: return
+        if (ready.playerError != null || ready.playbackState != Player.STATE_READY) return
+        gaplessHandoffFor = currentId
+        Logger.d(TAG, "Gapless hand-off to $nextId with ${remaining}ms left")
+        handleTrackEndInternal()
     }
 
     private fun stopPositionUpdates() {

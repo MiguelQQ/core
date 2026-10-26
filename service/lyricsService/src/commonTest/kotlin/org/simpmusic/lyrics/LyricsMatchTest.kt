@@ -61,4 +61,16 @@ class LyricsMatchTest {
             ),
         )
     }
+
+    @Test
+    fun similar_titles_by_other_versions_are_not_this_recording() {
+        assertFalse(lyricsTitleMatches("Palabras Sobran", "Palabras Sobran (Live)"))
+        assertFalse(lyricsTitleMatches("Palabras Sobran", "Palabras Sobran (Acoustic Version)"))
+        assertFalse(
+            lyricsIdentityMatches("Palabras Sobran", "Blessd", 216, "Palabras Sobran", "Feid", 216),
+        )
+        assertFalse(
+            lyricsIdentityMatches("Palabras Sobran", "", 216, "Palabras Sobran", "Blessd", 216),
+        )
+    }
 }
