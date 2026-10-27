@@ -22,6 +22,15 @@ class LiveRoomSyncTest {
         val snapshot = Json.parseToJsonElement("""{"videoId":"dQw4w9WgXcQ","title":"Título","artist":"Artista","duration_ms":123000,"unknown":true}""").let { it as kotlinx.serialization.json.JsonObject }
         assertEquals(track, decodeJamTrack(snapshot))
     }
+    @Test fun loadingSnapshotKeepsAdvancedPositionAndContributors() {
+        val raw = """{"code":"ABC234","seq":8,"phase":"loading","host_id":"a","playing":false,"position":87.125,"server_time":1000,"current_qid":7,"queue":[{"qid":7,"videoId":"dQw4w9WgXcQ","added_by":"Ana"},{"qid":8,"videoId":"aaaaaaaaaaa","added_by":"Bob"}],"members":[],"gate":{"waiting":["b"],"timed_out":false}}"""
+        val room = decodeJamState(Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject, ListenTogetherState(selfUserId = "b"))
+        assertTrue(room.loading)
+        assertFalse(room.isPlaying)
+        assertEquals(87125L, room.position)
+        assertEquals(listOf("Ana", "Bob"), room.queueContributors)
+        assertEquals(listOf(7L, 8L), room.queueIds)
+    }
     @Test fun gateAndHostTransferDecode() {
         val raw = """{"code":"ABC234","seq":5,"phase":"loading","host_id":"a","playing":false,"position":0,"server_time":1000,"current_qid":7,"queue":[{"qid":7,"videoId":"dQw4w9WgXcQ","title":"A"}],"members":[{"id":"b","name":"B","connected":true,"loading":true}],"gate":{"waiting":["b"],"timed_out":true}}"""
         val json = Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject

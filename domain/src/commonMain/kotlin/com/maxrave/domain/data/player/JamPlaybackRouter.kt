@@ -6,6 +6,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 object JamPlaybackRouter {
     interface Actions {
         fun add(item: GenericMediaItem)
+        fun play(item: GenericMediaItem) = add(item)
+        fun queue(type: String, index: Int, to: Int? = null) {}
         fun control(type: String, positionMs: Long? = null)
     }
     private val current = MutableStateFlow<Actions?>(null)

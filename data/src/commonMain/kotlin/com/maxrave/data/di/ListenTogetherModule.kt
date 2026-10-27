@@ -38,6 +38,7 @@ val listenTogetherModule =
                 repository = get(),
                 session = get(),
                 handler = get(),
+                songs = get(),
                 scope = get<CoroutineScope>(named(Config.SERVICE_SCOPE)),
             ).also { it.start() }
         }

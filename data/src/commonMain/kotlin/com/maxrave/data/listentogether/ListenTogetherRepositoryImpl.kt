@@ -129,6 +129,8 @@ private fun ListenTogetherState.toDomain() =
         error = error,
         gateTimedOut = gateTimedOut,
         queueIds = queueIds,
+        queueContributors = queueContributors,
+        loading = loading,
     )
 
 private fun ConnectionState.toDomain(): RoomConnection =

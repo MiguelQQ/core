@@ -88,6 +88,7 @@ data class ListenTogetherState(
     val loading: Boolean = false,
     val gateTimedOut: Boolean = false,
     val queueIds: List<Long> = emptyList(),
+    val queueContributors: List<String> = emptyList(),
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is ConnectionState.Connected
@@ -109,7 +110,7 @@ class ListenTogetherSession internal constructor(
 
     override val coroutineContext = SupervisorJob() + dispatcher
     private val client = HttpClient(getEngine()) {
-        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.12" }
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.13" }
         install(WebSockets)
         install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
     }
@@ -123,14 +124,14 @@ class ListenTogetherSession internal constructor(
     private var pingAt = 0L
     private var forcedSeq = -1L
     private var failedSeq = -1L
-    private val additions = Channel<Pair<String, TrackInfo>>(Channel.UNLIMITED)
+    private val additions = Channel<Triple<String, TrackInfo, Boolean>>(Channel.UNLIMITED)
     init {
         launch {
-            for ((code, track) in additions) {
+            for ((code, track, play) in additions) {
                 state.first { it.roomCode != code || it.isConnected }
                 if (state.value.roomCode != code) continue
                 try {
-                    send("queue_add") { put("track", encodeJamTrack(track)) }
+                    send("queue_add") { put("track", encodeJamTrack(track)); if (play) put("play", true) }
                 } catch (e: CancellationException) { throw e }
                 catch (e: Exception) { playbackError("No se pudo añadir la canción. Comprueba la conexión con la JAM.") }
                 // Keep playlist additions below S2's 60 messages/10 s, leaving room for pos/ping.
@@ -210,7 +211,7 @@ class ListenTogetherSession internal constructor(
         when (m.string("type")) {
             "welcome" -> { _state.update { it.copy(selfUserId = m.string("you"), error = null) }; applyState(m.getValue("state").jsonObject) }
             "state" -> applyState(m.getValue("state").jsonObject)
-            "clock" -> if (m.long("seq") == state.value.seq) _state.update { it.copy(position = (m.getValue("position").jsonPrimitive.double * 1000).toLong(), lastActionServerTime = m.long("server_time"), isPlaying = true) }
+            "clock" -> if (m.long("seq") == state.value.seq && !state.value.loading) _state.update { it.copy(position = (m.getValue("position").jsonPrimitive.double * 1000).toLong(), lastActionServerTime = m.long("server_time"), isPlaying = true) }
             "pong" -> { val t = m.long("server_time"); clock.recordPong(pingAt, t, t) }
             "error" -> _state.update { it.copy(error = m.string("message"), pendingJoinCode = null) }
             "closed" -> { disconnect(); _state.update { it.copy(error = "La JAM se cerró") } }
@@ -249,14 +250,17 @@ class ListenTogetherSession internal constructor(
             command("ready") { put("seq", seq) }
         }
     }
+    fun contribute(tracks: List<TrackInfo>) = command("queue_contribute") {
+        put("tracks", JsonArray(tracks.filter { Regex("^[A-Za-z0-9_-]{11}$").matches(it.id) }.distinctBy { it.id }.take(30).map(::encodeJamTrack)))
+    }
     fun requestSync() = command("sync")
     fun forcePlay() = command("force_play")
     fun transferHost(userId: String) = command("transfer_host") { put("user_id", userId) }
     fun removeTrack(qid: Long) = command("queue_remove") { put("qid", qid) }
     fun moveTrack(qid: Long, to: Int) = command("queue_move") { put("qid", qid); put("to", to) }
-    fun suggestTrack(track: TrackInfo) {
+    fun suggestTrack(track: TrackInfo, play: Boolean = false) {
         val code = state.value.roomCode ?: return
-        additions.trySend(code to track)
+        additions.trySend(Triple(code, track, play))
     }
     fun playbackError(message: String) { _state.update { it.copy(error = message) } }
     fun clearError() { _state.update { it.copy(error = null) } }
@@ -286,7 +290,7 @@ internal fun decodeJamState(s: JsonObject, old: ListenTogetherState): ListenToge
         val current = queue.firstOrNull { it.long("qid") == s.long("current_qid") }
         return old.copy(
             connection = ConnectionState.Connected("Killmon JAM"), roomCode = s.string("code"), pendingJoinCode = null,
-            isHost = host == old.selfUserId, queue = queue.map(::decodeJamTrack), queueIds = queue.map { it.long("qid") },
+            isHost = host == old.selfUserId, queue = queue.map(::decodeJamTrack), queueIds = queue.map { it.long("qid") }, queueContributors = queue.map { it.string("added_by") },
             currentTrack = current?.let(::decodeJamTrack), position = ((s["position"]?.jsonPrimitive?.doubleOrNull ?: 0.0) * 1000).toLong(),
             isPlaying = s["playing"]?.jsonPrimitive?.booleanOrNull == true, lastActionServerTime = s.long("server_time"),
             seq = s.long("seq"), loading = s.string("phase") == "loading", gateTimedOut = gate?.get("timed_out")?.jsonPrimitive?.booleanOrNull == true,

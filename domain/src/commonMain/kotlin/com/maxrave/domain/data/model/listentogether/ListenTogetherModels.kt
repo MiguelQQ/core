@@ -70,6 +70,8 @@ data class ListenTogetherRoom(
     val error: String? = null,
     val gateTimedOut: Boolean = false,
     val queueIds: List<Long> = emptyList(),
+    val queueContributors: List<String> = emptyList(),
+    val loading: Boolean = false,
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is RoomConnection.Connected

@@ -688,7 +688,8 @@ internal class MediaServiceHandlerImpl(
                         _controlState.update { it.copy(isLiked = false) }
                         var thumbUrl =
                             track?.thumbnails?.lastOrNull()?.url
-                                ?: "http://i.ytimg.com/vi/${track?.videoId}/maxresdefault.jpg"
+                                ?: mediaItem.metadata.artworkUri?.takeIf { it.isNotBlank() }
+                                ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
                         Logger.d(TAG, "getDataOfNowPlayingState before: $thumbUrl")
                         thumbUrl = Regex("=w\\d+-h\\d+").replace(thumbUrl, "=w544-h544")
                         val songEntity =
@@ -1302,6 +1303,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun removeMediaItem(position: Int) {
+        JamPlaybackRouter.actions?.let { it.queue("queue_remove", position); return }
         // A position handed in from the queue screen can be stale: a radio trims its played history
         // off the front while that screen is open. Check it against the queue as it is now, and
         // apply the removal to the current list rather than to a copy taken before.
@@ -1328,7 +1330,7 @@ internal class MediaServiceHandlerImpl(
         playWhenReady: Boolean,
     ) {
         JamPlaybackRouter.actions?.let { jam ->
-            jam.add(mediaItem); return
+            if (playWhenReady) jam.play(mediaItem) else jam.add(mediaItem); return
         }
 
         player.clearMediaItems()
@@ -1354,6 +1356,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun playMediaItemInMediaSource(index: Int) {
+        JamPlaybackRouter.actions?.let { it.queue("play_index", index); return }
         val i = if (player.shuffleModeEnabled) player.getUnshuffledIndex(index) else index
         player.seekTo(i, 0)
         player.prepare()
@@ -1366,6 +1369,7 @@ internal class MediaServiceHandlerImpl(
         from: Int,
         to: Int,
     ) {
+        JamPlaybackRouter.actions?.let { it.queue("queue_move", from, to); return }
 //        if (from < to) {
 //            for (i in from until to) {
 //                moveItemDown(i)
@@ -1782,6 +1786,7 @@ internal class MediaServiceHandlerImpl(
         from: Int,
         to: Int,
     ) {
+        JamPlaybackRouter.actions?.let { it.queue("queue_move", from, to); return }
         val tracks = queueData.value.data.listTracks
         // Checked against the queue as it is now, for the reason in removeMediaItem.
         if (from !in tracks.indices || to !in tracks.indices || from == to) return
@@ -2345,7 +2350,7 @@ internal class MediaServiceHandlerImpl(
                 else -> return
             }
         JamPlaybackRouter.actions?.let { jam ->
-            jam.add(track.toGenericMediaItem())
+            jam.play(track.toGenericMediaItem())
             if (type == PLAYLIST_CLICK || type == ALBUM_CLICK) {
                 queueData.value.data.listTracks.forEachIndexed { trackIndex, queued ->
                     if (trackIndex != (index ?: 0)) jam.add(queued.toGenericMediaItem())
