@@ -146,6 +146,7 @@ private fun ProtocolMember.toDomain() =
         isHost = isHost,
         isConnected = isConnected,
         isBuffering = isBuffering,
+        playbackFailed = playbackFailed,
     )
 
 private fun PendingJoin.toDomain() = RoomJoinRequest(userId = userId, username = username)

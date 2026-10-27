@@ -258,12 +258,6 @@ private fun provideResolvingDataSourceFactory(
 ): DataSource.Factory {
     val chunkLength = 10 * 512 * 1024L
     return ResolvingDataSource.Factory(cacheDataSourceFactory) { dataSpec ->
-        if (dataSpec.uri.scheme == "https" && dataSpec.uri.host == "killmon.seriepokemon.online" && dataSpec.uri.path?.startsWith("/api/jam/audio/") == true) {
-            return@Factory dataSpec
-        }
-        if (com.maxrave.domain.data.player.JamPlaybackRouter.actions != null) {
-            throw java.io.IOException("Añade la canción a la cola de la JAM")
-        }
         val mediaId = dataSpec.key ?: error("No media id")
         val videoId = mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
         // A live broadcast reached a progressive source that was built before it was known to be

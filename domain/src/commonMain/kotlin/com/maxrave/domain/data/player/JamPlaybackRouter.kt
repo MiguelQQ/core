@@ -12,5 +12,4 @@ object JamPlaybackRouter {
     var actions: Actions?
         get() = current.value
         set(value) { current.value = value }
-    fun isAudioUrl(uri: String?): Boolean = uri?.startsWith("https://killmon.seriepokemon.online/api/jam/audio/") == true
 }

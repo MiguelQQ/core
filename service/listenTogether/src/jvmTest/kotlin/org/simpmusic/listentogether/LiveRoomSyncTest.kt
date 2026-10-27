@@ -9,11 +9,11 @@ class LiveRoomSyncTest {
         assertTrue(JamSync.needsSeek(1000, 1501))
         assertTrue(JamSync.needsSeek(1501, 1000))
     }
-    @Test fun readyRequiresStateAndThreeSeconds() {
-        assertFalse(JamSync.ready(2, 10000, 0, 20000))
-        assertFalse(JamSync.ready(3, 2999, 0, 20000))
-        assertTrue(JamSync.ready(3, 3000, 0, 20000))
-        assertTrue(JamSync.ready(3, 2000, 0, 2000))
+    @Test fun readyUsesExoPlayerStateWithoutAdditionalBufferRequirement() {
+        assertFalse(JamSync.ready(1))
+        assertFalse(JamSync.ready(2))
+        assertTrue(JamSync.ready(3))
+        assertFalse(JamSync.ready(4))
     }
     @Test fun queueCodecUsesMillisecondsAndServerFields() {
         val track = TrackInfo(id = "dQw4w9WgXcQ", title = "Título", artist = "Artista", duration = 123000)

@@ -45,9 +45,6 @@ internal class MergingMediaSourceFactory(
     override fun getSupportedTypes(): IntArray = defaultMediaSourceFactory.supportedTypes
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
-        if (com.maxrave.domain.data.player.JamPlaybackRouter.isAudioUrl(mediaItem.localConfiguration?.uri?.toString())) {
-            return defaultMediaSourceFactory.createMediaSource(mediaItem)
-        }
         if (LiveStreamRegistry.isLive(mediaItem.mediaId)) {
             // One HLS playlist carrying audio and video together: no merge, and none of the
             // progressive resolver's caching or chunking.
@@ -59,6 +56,11 @@ internal class MergingMediaSourceFactory(
                     .setMimeType(MimeTypes.APPLICATION_M3U8)
                     .build(),
             )
+        }
+        // JAM still uses the normal resolving data source. SONG needs no video preference read
+        // (createMediaSource can run on Main), and no special server audio path.
+        if (mediaItem.mediaMetadata.description != MERGING_DATA_TYPE.VIDEO) {
+            return defaultMediaSourceFactory.createMediaSource(mediaItem)
         }
         Logger.w("Merging Media Source", mediaItem.mediaMetadata.description.toString())
         val getVideo = runBlocking(Dispatchers.IO) { dataStoreManager.watchVideoInsteadOfPlayingAudio.first() } == DataStoreManager.Values.TRUE

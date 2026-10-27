@@ -2,6 +2,7 @@ package com.maxrave.data.listentogether
 
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.JamPlaybackRouter
+import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
@@ -12,7 +13,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.put
 import org.simpmusic.listentogether.*
 
-/** Reuses the inherited player bridge, with S2 audio and the same barrier for host and guests. */
+/** Reuses the inherited player bridge, with local YouTube resolution and the same barrier for host and guests. */
 class ListenTogetherPlaybackBridge(
     private val repository: ListenTogetherRepository,
     private val session: ListenTogetherSession,
@@ -32,6 +33,16 @@ class ListenTogetherPlaybackBridge(
     private var lastRoomCode: String? = null
     private var lastRevisionTime = 0L
     private val listener = object : MediaPlayerListener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            reportReady()
+        }
+        override fun onPlayerError(error: PlayerError) {
+            val room = session.state.value
+            if (room.inRoom && handler.player.currentMediaItem?.mediaId == room.currentTrack?.id) {
+                readySeq = -1L
+                session.markPlaybackFailed()
+            }
+        }
         override fun onSeeked(positionMs: Long) {
             val room = session.state.value
             if (!applying && room.inRoom && room.isHost && !room.loading) session.command("seek") { put("position", positionMs / 1000.0) }
@@ -52,11 +63,28 @@ class ListenTogetherPlaybackBridge(
             session.command(type) { positionMs?.let { put("position", it.coerceAtLeast(0L) / 1000.0) } }
         }
     }
+    // Called on Main, both by the player event and the polling fallback.
+    private fun reportReady() {
+        val room = session.state.value
+        if (room.connection is ConnectionState.Connected && loadedSeq == room.seq &&
+            handler.player.currentMediaItem?.mediaId == room.currentTrack?.id &&
+            readySeq != room.seq && JamSync.ready(handler.player.playbackState)) {
+            readySeq = room.seq
+            session.reportBufferReady(room.currentTrack?.id.orEmpty(), room.seq)
+            session.clearPlaybackFailed()
+            if (!room.loading) {
+                applying = true
+                try { handler.player.seekTo(session.positionAt(room.position, room.isPlaying)) }
+                finally { applying = false }
+            }
+        }
+    }
+
     fun start() {
         if (started) return
         started = true
         scope.launch(Dispatchers.Main) { handler.player.addListener(listener) }
-        scope.launch {
+        scope.launch(Dispatchers.Main) {
             session.state.map { Triple(it.roomCode, it.seq, it.connection is ConnectionState.Connected) to it.selfUserId }.distinctUntilChanged().collectLatest { (key, selfId) ->
                 val (code, seq, connected) = key
                 if (code != null && selfId.isBlank()) return@collectLatest
@@ -66,7 +94,7 @@ class ListenTogetherPlaybackBridge(
                         handler.player.crossfadeSuppressed = false
                         if (lastRoomCode != null) {
                             applying = true
-                            handler.player.pause(); handler.clearMediaItems()
+                            handler.player.pause(); handler.player.clearMediaItems()
                             handler.player.playbackParameters = savedParameters
                             handler.player.skipSilenceEnabled = savedSkipSilence
                             handler.player.shuffleModeEnabled = savedShuffle; handler.player.repeatMode = savedRepeat
@@ -100,21 +128,22 @@ class ListenTogetherPlaybackBridge(
                     }
                 }
                 val track = session.state.value.currentTrack ?: run {
-                    withContext(Dispatchers.Main) { applying = true; handler.player.pause(); handler.clearMediaItems(); applying = false }
+                    withContext(Dispatchers.Main) { applying = true; handler.player.pause(); handler.player.clearMediaItems(); applying = false }
                     return@collectLatest
                 }
                 withContext(Dispatchers.Main) { applying = true; handler.player.pause(); applying = false }
                 try {
-                    val url = session.audioUrl(track.id)
                     withContext(Dispatchers.Main) {
                         applying = true
                         try {
-                            handler.clearMediaItems()
-                            handler.addMediaItem(GenericMediaItem(
-                                mediaId = track.id, uri = url,
+                            handler.player.clearMediaItems()
+                            handler.player.playWhenReady = false
+                            handler.player.setMediaItem(GenericMediaItem(
+                                mediaId = track.id, uri = "https://music.youtube.com/watch?v=${track.id}",
                                 metadata = GenericMediaMetadata(title = track.title, artist = track.artist, artworkUri = track.thumbnail, description = MERGING_DATA_TYPE.SONG),
-                                customCacheKey = "jam:$code:$seq:${track.id}",
-                            ), playWhenReady = false)
+                                customCacheKey = track.id,
+                            ))
+                            handler.player.prepare()
                             handler.player.shuffleModeEnabled = false; handler.player.repeatMode = 0
                             handler.player.playbackParameters = com.maxrave.domain.data.player.GenericPlaybackParameters(1f, 1f)
                             if (!session.state.value.loading) handler.player.seekTo(session.positionAt(session.state.value.position, session.state.value.isPlaying))
@@ -122,7 +151,7 @@ class ListenTogetherPlaybackBridge(
                         } finally { applying = false }
                     }
                 } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { session.playbackError("No se pudo cargar el audio de la JAM. Reintenta entrando a la sala.") }
+                catch (e: Exception) { session.markPlaybackFailed() }
             }
         }
         scope.launch(Dispatchers.Main) {
@@ -136,12 +165,7 @@ class ListenTogetherPlaybackBridge(
                 player.skipSilenceEnabled = false
                 if (player.playbackParameters.speed != 1f) player.playbackParameters = com.maxrave.domain.data.player.GenericPlaybackParameters()
                 val target = session.positionAt(room.position, room.isPlaying)
-                if (readySeq != room.seq && JamSync.ready(player.playbackState, player.bufferedPosition, player.currentPosition, player.duration)) {
-                    readySeq = room.seq
-                    session.reportBufferReady(room.currentTrack?.id.orEmpty(), room.seq)
-                    // Late joiners land at the current host time after buffering, not their arrival time.
-                    if (!room.loading) { applying = true; player.seekTo(target); applying = false }
-                }
+                reportReady()
                 applying = true
                 try {
                     val shouldPlay = readySeq == room.seq && !room.loading && room.isPlaying

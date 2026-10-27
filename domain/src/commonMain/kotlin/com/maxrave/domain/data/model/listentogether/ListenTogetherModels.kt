@@ -28,6 +28,7 @@ data class RoomMember(
     val isConnected: Boolean,
     /** True while this member has not reported the current track as ready. */
     val isBuffering: Boolean = false,
+    val playbackFailed: Boolean = false,
 )
 
 data class RoomJoinRequest(

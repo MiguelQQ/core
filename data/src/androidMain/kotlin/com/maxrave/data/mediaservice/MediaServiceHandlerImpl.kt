@@ -1328,7 +1328,7 @@ internal class MediaServiceHandlerImpl(
         playWhenReady: Boolean,
     ) {
         JamPlaybackRouter.actions?.let { jam ->
-            if (!JamPlaybackRouter.isAudioUrl(mediaItem.uri)) { jam.add(mediaItem); return }
+            jam.add(mediaItem); return
         }
 
         player.clearMediaItems()
@@ -1338,12 +1338,13 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun clearMediaItems() {
+        if (JamPlaybackRouter.actions != null) return
         player.clearMediaItems()
     }
 
     override fun addMediaItemList(mediaItemList: List<GenericMediaItem>) {
         JamPlaybackRouter.actions?.let { jam ->
-            mediaItemList.filterNot { JamPlaybackRouter.isAudioUrl(it.uri) }.forEach(jam::add)
+            mediaItemList.forEach(jam::add)
             return
         }
 
@@ -1817,6 +1818,12 @@ internal class MediaServiceHandlerImpl(
         downloaded: Int,
         index: Int?,
     ) {
+        JamPlaybackRouter.actions?.let { jam ->
+            queueData.value.data.listTracks.forEachIndexed { trackIndex, track ->
+                if (trackIndex != index) jam.add(track.toGenericMediaItem())
+            }
+            return
+        }
         updateCatalog(downloaded, index).let {
             if (index != 0 && index != null) {
                 moveMediaItem(0, index)
@@ -2337,7 +2344,15 @@ internal class MediaServiceHandlerImpl(
                 is SongEntity -> anyTrack.toTrack()
                 else -> return
             }
-        JamPlaybackRouter.actions?.let { it.add(track.toGenericMediaItem()); return }
+        JamPlaybackRouter.actions?.let { jam ->
+            jam.add(track.toGenericMediaItem())
+            if (type == PLAYLIST_CLICK || type == ALBUM_CLICK) {
+                queueData.value.data.listTracks.forEachIndexed { trackIndex, queued ->
+                    if (trackIndex != (index ?: 0)) jam.add(queued.toGenericMediaItem())
+                }
+            }
+            return
+        }
         if (track.isExplicit && dataStoreManager.explicitContentEnabled.first() == FALSE) {
             showToast(ToastType.ExplicitContent)
             return

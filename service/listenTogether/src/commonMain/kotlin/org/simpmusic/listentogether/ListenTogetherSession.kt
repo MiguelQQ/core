@@ -10,6 +10,7 @@ import io.ktor.http.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.serialization.json.*
 import kotlin.time.TimeSource
 import kotlin.coroutines.CoroutineContext
@@ -34,6 +35,7 @@ data class RoomMember(
     val isConnected: Boolean,
     /** True while this member has not answered `buffer_ready` for the current track. */
     val isBuffering: Boolean = false,
+    val playbackFailed: Boolean = false,
 )
 
 data class PendingJoin(
@@ -96,14 +98,18 @@ data class ListenTogetherState(
 }
 
 /** Killmon JAM JSON transport. Account credentials are read asynchronously for each connection. */
-class ListenTogetherSession(
+class ListenTogetherSession internal constructor(
     private val accessToken: suspend () -> String?,
-    private val baseUrl: String = BASE,
+    private val baseUrl: String,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : CoroutineScope {
+    // Production callers cannot override the room server. Local fixtures use the internal constructor.
+    constructor(accessToken: suspend () -> String?, dispatcher: CoroutineContext = Dispatchers.Default) :
+        this(accessToken, BASE, dispatcher)
+
     override val coroutineContext = SupervisorJob() + dispatcher
     private val client = HttpClient(getEngine()) {
-        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.11" }
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.12" }
         install(WebSockets)
         install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
     }
@@ -115,7 +121,23 @@ class ListenTogetherSession(
     private fun elapsed() = start.elapsedNow().inWholeMilliseconds + 1
     private val clock = ServerClock(::elapsed)
     private var pingAt = 0L
-    private val audioUrls = MutableStateFlow<Map<String, String>>(emptyMap())
+    private var forcedSeq = -1L
+    private var failedSeq = -1L
+    private val additions = Channel<Pair<String, TrackInfo>>(Channel.UNLIMITED)
+    init {
+        launch {
+            for ((code, track) in additions) {
+                state.first { it.roomCode != code || it.isConnected }
+                if (state.value.roomCode != code) continue
+                try {
+                    send("queue_add") { put("track", encodeJamTrack(track)) }
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) { playbackError("No se pudo añadir la canción. Comprueba la conexión con la JAM.") }
+                // Keep playlist additions below S2's 60 messages/10 s, leaving room for pos/ping.
+                delay(250)
+            }
+        }
+    }
     var autoApproveJoins = true
     var autoApproveSuggestions = true
 
@@ -148,15 +170,22 @@ class ListenTogetherSession(
                 coroutineScope {
                     val live = client.webSocketSession("${baseUrl.replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")}/api/jam/ws")
                     socket = live
-                    clock.reset(); audioUrls.value = emptyMap()
+                    clock.reset()
+                    forcedSeq = -1L
+                    val welcomed = CompletableDeferred<Unit>()
                     try {
                         live.send(Frame.Text(obj { put("type", "auth"); put("token", token); put("code", code); put("caps", obj { put("ready", true) }) }.toString()))
                         val pinger = launch {
+                            welcomed.await()
                             while (isActive) { pingAt = elapsed(); send("ping"); delay(3000) }
                         }
                         try {
                             for (frame in live.incoming) {
-                                if (frame is Frame.Text) onMessage(Json.parseToJsonElement(frame.readText()).jsonObject)
+                                if (frame is Frame.Text) {
+                                    val message = Json.parseToJsonElement(frame.readText()).jsonObject
+                                    onMessage(message)
+                                    if (message.string("type") == "welcome") welcomed.complete(Unit)
+                                }
                                 if (_state.value.roomCode != null) attempts = 0
                             }
                         } finally { pinger.cancel() }
@@ -183,31 +212,57 @@ class ListenTogetherSession(
             "state" -> applyState(m.getValue("state").jsonObject)
             "clock" -> if (m.long("seq") == state.value.seq) _state.update { it.copy(position = (m.getValue("position").jsonPrimitive.double * 1000).toLong(), lastActionServerTime = m.long("server_time"), isPlaying = true) }
             "pong" -> { val t = m.long("server_time"); clock.recordPong(pingAt, t, t) }
-            "audio" -> audioUrls.update { it + (m.string("video_id") to "$baseUrl${m.string("path")}?t=${m.string("token")}") }
             "error" -> _state.update { it.copy(error = m.string("message"), pendingJoinCode = null) }
             "closed" -> { disconnect(); _state.update { it.copy(error = "La JAM se cerró") } }
         }
     }
-    private fun applyState(s: JsonObject) { _state.update { decodeJamState(s, it) } }
-    suspend fun audioUrl(videoId: String): String {
-        audioUrls.update { it - videoId }
-        send("audio") { put("video_id", videoId) }
-        return withTimeout(15_000) { audioUrls.map { it[videoId] }.filterNotNull().first() }
+    private fun applyState(s: JsonObject) {
+        _state.update { old ->
+            val decoded = decodeJamState(s, old)
+            decoded.copy(members = decoded.members.map { member ->
+                member.copy(playbackFailed = member.userId == decoded.selfUserId && failedSeq == decoded.seq)
+            })
+        }
+        val room = state.value
+        if (room.isHost && room.loading && room.gateTimedOut && forcedSeq != room.seq) {
+            forcedSeq = room.seq
+            playbackError("La espera de carga terminó. La JAM continuará; quienes sigan cargando se unirán cuando estén listos.")
+            forcePlay()
+        }
+    }
+    fun markPlaybackFailed() {
+        failedSeq = state.value.seq
+        _state.update { room -> room.copy(
+            error = "Falló la carga de YouTube en este teléfono. La JAM continuará para los demás. Vuelve a entrar para reintentar.",
+            members = room.members.map { if (it.userId == room.selfUserId) it.copy(playbackFailed = true) else it },
+        ) }
+    }
+    fun clearPlaybackFailed() {
+        failedSeq = -1L
+        _state.update { room -> room.copy(members = room.members.map { it.copy(playbackFailed = false) }) }
     }
     fun serverNow() = clock.now()
     fun positionAt(position: Long, isPlaying: Boolean) = clock.positionAt(position, state.value.lastActionServerTime, isPlaying)
-    fun reportBufferReady(trackId: String, seq: Long = state.value.seq) = command("ready") { put("seq", seq) }
+    fun reportBufferReady(trackId: String, seq: Long = state.value.seq) {
+        val room = state.value
+        if (room.isConnected && room.seq == seq && room.currentTrack?.id == trackId) {
+            command("ready") { put("seq", seq) }
+        }
+    }
     fun requestSync() = command("sync")
     fun forcePlay() = command("force_play")
     fun transferHost(userId: String) = command("transfer_host") { put("user_id", userId) }
     fun removeTrack(qid: Long) = command("queue_remove") { put("qid", qid) }
     fun moveTrack(qid: Long, to: Int) = command("queue_move") { put("qid", qid); put("to", to) }
-    fun suggestTrack(track: TrackInfo) = command("queue_add") { put("track", encodeJamTrack(track)) }
+    fun suggestTrack(track: TrackInfo) {
+        val code = state.value.roomCode ?: return
+        additions.trySend(code to track)
+    }
     fun playbackError(message: String) { _state.update { it.copy(error = message) } }
     fun clearError() { _state.update { it.copy(error = null) } }
     fun cancelJoin() = disconnect()
     fun leaveRoom() { launch { try { send("leave") } finally { disconnect() } } }
-    fun disconnect() { connection?.cancel(); connection = null; socket = null; audioUrls.value = emptyMap(); _state.value = ListenTogetherState() }
+    fun disconnect() { failedSeq = -1L; forcedSeq = -1L; connection?.cancel(); connection = null; socket = null; _state.value = ListenTogetherState() }
     fun release() { disconnect(); client.close(); cancel() }
     fun approveJoin(userId: String) = Unit
     fun rejectJoin(userId: String) = Unit
