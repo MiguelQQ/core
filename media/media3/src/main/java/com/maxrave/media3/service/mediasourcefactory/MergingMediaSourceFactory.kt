@@ -45,6 +45,9 @@ internal class MergingMediaSourceFactory(
     override fun getSupportedTypes(): IntArray = defaultMediaSourceFactory.supportedTypes
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
+        if (com.maxrave.domain.data.player.JamPlaybackRouter.isAudioUrl(mediaItem.localConfiguration?.uri?.toString())) {
+            return defaultMediaSourceFactory.createMediaSource(mediaItem)
+        }
         if (LiveStreamRegistry.isLive(mediaItem.mediaId)) {
             // One HLS playlist carrying audio and video together: no merge, and none of the
             // progressive resolver's caching or chunking.

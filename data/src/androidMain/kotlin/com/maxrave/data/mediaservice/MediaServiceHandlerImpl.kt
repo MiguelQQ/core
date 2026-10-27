@@ -36,6 +36,7 @@ import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
+import com.maxrave.domain.data.player.JamPlaybackRouter
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.data.player.GenericPlaybackParameters
@@ -484,7 +485,7 @@ internal class MediaServiceHandlerImpl(
                         .collect { current ->
                             val categories = sponsorBlockCategories.value
                             val skipSegments = skipSegments.value
-                            if (categories != null && player.duration > 0L && skipSegments != null) {
+                            if (JamPlaybackRouter.actions == null && categories != null && player.duration > 0L && skipSegments != null) {
                                 for (skip in skipSegments) {
                                     if (categories.contains(skip.category)) {
                                         if (skip.segment[1] - skip.segment[0] < SPONSOR_BLOCK_MIN_SEGMENT_SECONDS) {
@@ -873,6 +874,7 @@ internal class MediaServiceHandlerImpl(
         mediaItem: GenericMediaItem,
         index: Int? = null,
     ) {
+        JamPlaybackRouter.actions?.let { it.add(mediaItem); return }
         index?.let {
             player.addMediaItem(it, mediaItem)
         } ?: player.addMediaItem(mediaItem)
@@ -1024,6 +1026,19 @@ internal class MediaServiceHandlerImpl(
     }
 
     override suspend fun onPlayerEvent(playerEvent: PlayerEvent) {
+        JamPlaybackRouter.actions?.let { jam ->
+            when (playerEvent) {
+                PlayerEvent.PlayPause -> jam.control(if (player.playWhenReady) "pause" else "play", player.currentPosition)
+                PlayerEvent.Next -> jam.control("next")
+                PlayerEvent.Previous, PlayerEvent.SkipToPrevious -> jam.control("prev")
+                PlayerEvent.Backward -> jam.control("seek", player.currentPosition - 10_000)
+                PlayerEvent.Forward -> jam.control("seek", player.currentPosition + 10_000)
+                is PlayerEvent.UpdateProgress -> jam.control("seek", (player.duration * playerEvent.newProgress / 100).toLong())
+                else -> Unit
+            }
+            return
+        }
+
         when (playerEvent) {
             is PlayerEvent.UpdateVolume -> {}
 
@@ -1312,6 +1327,10 @@ internal class MediaServiceHandlerImpl(
         mediaItem: GenericMediaItem,
         playWhenReady: Boolean,
     ) {
+        JamPlaybackRouter.actions?.let { jam ->
+            if (!JamPlaybackRouter.isAudioUrl(mediaItem.uri)) { jam.add(mediaItem); return }
+        }
+
         player.clearMediaItems()
         player.setMediaItem(mediaItem)
         player.prepare()
@@ -1323,6 +1342,11 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun addMediaItemList(mediaItemList: List<GenericMediaItem>) {
+        JamPlaybackRouter.actions?.let { jam ->
+            mediaItemList.filterNot { JamPlaybackRouter.isAudioUrl(it.uri) }.forEach(jam::add)
+            return
+        }
+
         for (mediaItem in mediaItemList) {
             addMediaItemNotSet(mediaItem)
         }
@@ -1403,6 +1427,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun loadMore() {
+        if (JamPlaybackRouter.actions != null) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         // Separate local and remote data
         // Local Add Prefix to PlaylistID to differentiate between local and remote
@@ -1677,6 +1702,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun getRelated(videoId: String) {
+        if (JamPlaybackRouter.actions != null) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         coroutineScope.launch {
             songRepository.getRelatedData(videoId).collect { response ->
@@ -2178,6 +2204,8 @@ internal class MediaServiceHandlerImpl(
     }
 
     override suspend fun playNext(track: Track) {
+        JamPlaybackRouter.actions?.let { it.add(track.toGenericMediaItem()); return }
+
         _queueData.update {
             it.copy(
                 queueState = QueueData.StateSource.STATE_INITIALIZING,
@@ -2309,6 +2337,7 @@ internal class MediaServiceHandlerImpl(
                 is SongEntity -> anyTrack.toTrack()
                 else -> return
             }
+        JamPlaybackRouter.actions?.let { it.add(track.toGenericMediaItem()); return }
         if (track.isExplicit && dataStoreManager.explicitContentEnabled.first() == FALSE) {
             showToast(ToastType.ExplicitContent)
             return

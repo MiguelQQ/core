@@ -1,18 +1,18 @@
 package org.simpmusic.listentogether
 
-import com.maxrave.logger.Logger
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
+import com.maxrave.ktorext.getEngine
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.websocket.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.*
+import io.ktor.websocket.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.serialization.json.*
+import kotlin.time.TimeSource
 import kotlin.coroutines.CoroutineContext
-
-private const val TAG = "ListenTogetherSession"
 
 /** Where the socket is, independent of whether a room has been joined. */
 sealed interface ConnectionState {
@@ -82,6 +82,10 @@ data class ListenTogetherState(
     val pendingJoinCode: String? = null,
     /** Set once and cleared by the UI, so a transient failure cannot wedge the screen. */
     val error: String? = null,
+    val seq: Long = 0,
+    val loading: Boolean = false,
+    val gateTimedOut: Boolean = false,
+    val queueIds: List<Long> = emptyList(),
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is ConnectionState.Connected
@@ -91,414 +95,149 @@ data class ListenTogetherState(
         get() = waitingFor.mapNotNull { id -> members.firstOrNull { it.userId == id }?.username }
 }
 
-/**
- * The room state machine.
- *
- * Consumes [ListenTogetherClient.events] and never touches a frame, which is what keeps it
- * testable without a socket and identical on Android and Desktop — the two platforms run entirely
- * separate player handlers, so anything that reached into playback from here would have to be
- * written twice.
- */
+/** Killmon JAM JSON transport. Account credentials are read asynchronously for each connection. */
 class ListenTogetherSession(
-    private val client: ListenTogetherClient,
+    private val accessToken: suspend () -> String?,
+    private val baseUrl: String = BASE,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : CoroutineScope {
-    override val coroutineContext: CoroutineContext = SupervisorJob() + dispatcher
-
+    override val coroutineContext = SupervisorJob() + dispatcher
+    private val client = HttpClient(getEngine()) {
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.11" }
+        install(WebSockets)
+        install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
+    }
     private val _state = MutableStateFlow(ListenTogetherState())
-    val state: StateFlow<ListenTogetherState> = _state.asStateFlow()
+    val state = _state.asStateFlow()
+    private var socket: DefaultClientWebSocketSession? = null
+    private var connection: Job? = null
+    private val start = TimeSource.Monotonic.markNow()
+    private fun elapsed() = start.elapsedNow().inWholeMilliseconds + 1
+    private val clock = ServerClock(::elapsed)
+    private var pingAt = 0L
+    private val audioUrls = MutableStateFlow<Map<String, String>>(emptyMap())
+    var autoApproveJoins = true
+    var autoApproveSuggestions = true
 
-    private var pump: Job? = null
-
-    /** Host-side conveniences from settings; both default off, matching the design's toggles. */
-    var autoApproveJoins: Boolean = false
-    var autoApproveSuggestions: Boolean = false
-
-    /** Opens the socket. Joining a room is a separate, later step. */
-    fun connect() {
-        if (pump == null) {
-            pump = launch { client.events.collect(::onEvent) }
-        }
-        _state.update { it.copy(connection = ConnectionState.Connecting, error = null) }
-        client.connect()
-    }
-
-    fun disconnect() {
-        client.disconnect()
-        _state.value = ListenTogetherState()
-    }
-
-    fun createRoom(username: String) =
-        launch {
-            pendingUsername = username.trim()
-            client.send(MessageTypes.CREATE_ROOM, CreateRoomPayload(username = pendingUsername))
-        }
-
-    fun joinRoom(
-        roomCode: String,
-        username: String,
-    ) = launch {
-        pendingUsername = username.trim()
-        val code = roomCode.trim().uppercase()
-        _state.update { it.copy(pendingJoinCode = code, error = null) }
-        val sent = client.send(MessageTypes.JOIN_ROOM, JoinRoomPayload(roomCode = code, username = pendingUsername))
-        if (!sent) {
-            _state.update { it.copy(pendingJoinCode = null, error = "Not connected") }
+    fun connect() { _state.update { it.copy(connection = ConnectionState.Connected("Killmon JAM")) } }
+    fun createRoom(username: String) = enter(null)
+    fun joinRoom(roomCode: String, username: String) = enter(roomCode.trim().uppercase())
+    private fun enter(code: String?) {
+        connection?.cancel()
+        _state.update { it.copy(connection = ConnectionState.Connecting, pendingJoinCode = code, error = null) }
+        connection = launch {
+            try {
+                val token = accessToken() ?: error("Inicia sesión con tu cuenta Killmon")
+                val response = client.post("$baseUrl/api/jam/${if (code == null) "rooms" else "join"}") {
+                    bearerAuth(token); contentType(ContentType.Application.Json)
+                    setBody(obj { if (code != null) put("code", code) }.toString())
+                }
+                val json = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+                if (response.status.value !in 200..299) error(json["message"]?.jsonPrimitive?.content ?: "No se pudo entrar a la JAM")
+                val roomCode = json.getValue("code").jsonPrimitive.content
+                runSocket(roomCode)
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { _state.update { it.copy(connection = ConnectionState.Failed(e.message ?: "Error de conexión"), pendingJoinCode = null, error = e.message) } }
         }
     }
-
-    /** Gives up on a join that has not been answered. Local only — the server needs no message. */
-    fun cancelJoin() = _state.update { it.copy(pendingJoinCode = null) }
-
-    fun leaveRoom() =
-        launch {
-            client.send(MessageTypes.LEAVE_ROOM, LeaveRoomPayload())
-            // The server sends nothing back for leave_room, so the local state is cleared here —
-            // waiting for a confirmation that never arrives would leave the room UI on screen.
-            _state.update {
-                it.copy(
-                    roomCode = null,
-                    isHost = false,
-                    members = emptyList(),
-                    joinRequests = emptyList(),
-                    suggestions = emptyList(),
-                    currentTrack = null,
-                    waitingFor = emptyList(),
-                )
-            }
-        }
-
-    fun approveJoin(userId: String) =
-        launch {
-            client.send(MessageTypes.APPROVE_JOIN, ApproveJoinPayload(userId = userId))
-            _state.update { s -> s.copy(joinRequests = s.joinRequests.filterNot { it.userId == userId }) }
-        }
-
-    fun rejectJoin(userId: String) =
-        launch {
-            client.send(MessageTypes.REJECT_JOIN, RejectJoinPayload(userId = userId))
-            _state.update { s -> s.copy(joinRequests = s.joinRequests.filterNot { it.userId == userId }) }
-        }
-
-    fun approveSuggestion(suggestionId: String) =
-        launch {
-            client.send(MessageTypes.APPROVE_SUGGESTION, ApproveSuggestionPayload(suggestionId = suggestionId))
-            dropSuggestion(suggestionId)
-        }
-
-    fun rejectSuggestion(suggestionId: String) =
-        launch {
-            client.send(MessageTypes.REJECT_SUGGESTION, RejectSuggestionPayload(suggestionId = suggestionId))
-            dropSuggestion(suggestionId)
-        }
-
-    fun kickUser(userId: String) =
-        launch { client.send(MessageTypes.KICK_USER, KickUserPayload(userId = userId)) }
-
-    fun transferHost(userId: String) =
-        launch { client.send(MessageTypes.TRANSFER_HOST, TransferHostPayload(newHostId = userId)) }
-
-    fun suggestTrack(track: TrackInfo) =
-        launch { client.send(MessageTypes.SUGGEST_TRACK, SuggestTrackPayload(trackInfo = track)) }
-
-    /**
-     * Publishes one transport command to the room. Host only — the server ignores it from a guest.
-     *
-     * `capturedAtServerTime` is what lets a late-arriving PLAY still land on the right position:
-     * the receiver advances [position] by however long the frame spent in flight, measured on the
-     * SERVER's clock rather than its own. Sending 0 (an uncalibrated clock) is safe — the receiver
-     * treats it as "unknown" and uses the raw position.
-     */
-    fun sendPlaybackAction(
-        action: String,
-        trackId: String,
-        position: Long,
-        trackInfo: TrackInfo?,
-        queue: List<TrackInfo> = emptyList(),
-        queueTitle: String = "",
-    ) = launch {
-        client.send(
-            MessageTypes.PLAYBACK_ACTION,
-            PlaybackActionPayload(
-                action = action,
-                trackId = trackId,
-                position = position,
-                trackInfo = trackInfo,
-                // Carried on the SAME message as the track deliberately. Sent separately they are
-                // two independent sends with no ordering guarantee, and a queue arriving after the
-                // track means the guest has already committed to a one-track queue — it then plays
-                // its own next song and the room splits one track later.
-                queue = queue,
-                queueTitle = queueTitle,
-                capturedAtServerTime = client.serverNow() ?: 0L,
-            ),
-        )
-    }
-
-    /** Publishes the whole queue. Host only; guests take the host's order verbatim. */
-    fun sendQueue(
-        tracks: List<TrackInfo>,
-        queueTitle: String,
-    ) = launch {
-        client.send(
-            MessageTypes.PLAYBACK_ACTION,
-            PlaybackActionPayload(
-                action = PlaybackActions.SYNC_QUEUE,
-                queue = tracks,
-                queueTitle = queueTitle,
-                capturedAtServerTime = client.serverNow() ?: 0L,
-            ),
-        )
-    }
-
-    /** See `ServerClock.positionAt` — corrects a room position for time spent in flight. */
-    fun positionAt(
-        position: Long,
-        isPlaying: Boolean,
-    ): Long = client.positionAt(position, _state.value.lastActionServerTime, isPlaying)
-
-    /**
-     * Asks the server for the room's current state.
-     *
-     * This is how a guest rejoins the room's timeline after driving its own transport: the server
-     * answers `sync_state` with the live position, so pressing play lands where everyone else
-     * actually is rather than where this device happened to stop.
-     */
-    fun requestSync() =
-        launch {
-            client.send(MessageTypes.REQUEST_SYNC, null)
-        }
-
-    /** Answers the buffer barrier for [trackId]; until every member does, nobody hears anything. */
-    fun reportBufferReady(trackId: String) =
-        launch { client.send(MessageTypes.BUFFER_READY, BufferReadyPayload(trackId = trackId)) }
-
-    fun clearError() = _state.update { it.copy(error = null) }
-
-    fun release() {
-        client.release()
-        pump = null
-    }
-
-    private fun dropSuggestion(id: String) =
-        _state.update { s -> s.copy(suggestions = s.suggestions.filterNot { it.suggestionId == id }) }
-
-    private fun onEvent(event: ListenTogetherEvent) {
-        when (event) {
-            is ListenTogetherEvent.Connected ->
-                _state.update { it.copy(connection = ConnectionState.Connected(event.serverVersion)) }
-
-            is ListenTogetherEvent.ClockReady -> Unit
-
-            is ListenTogetherEvent.Disconnected ->
-                _state.update {
-                    if (event.willRetry) {
-                        it.copy(connection = ConnectionState.Connecting)
-                    } else {
-                        // Losing the socket loses the room with it; leaving the room UI up would
-                        // offer controls that silently do nothing.
-                        ListenTogetherState(connection = ConnectionState.Failed(event.reason ?: "Disconnected"))
-                    }
+    private suspend fun runSocket(code: String) {
+        var attempts = 0
+        while (currentCoroutineContext().isActive) {
+            try {
+                val token = accessToken() ?: error("Inicia sesión con Killmon")
+                coroutineScope {
+                    val live = client.webSocketSession("${baseUrl.replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")}/api/jam/ws")
+                    socket = live
+                    clock.reset(); audioUrls.value = emptyMap()
+                    try {
+                        live.send(Frame.Text(obj { put("type", "auth"); put("token", token); put("code", code); put("caps", obj { put("ready", true) }) }.toString()))
+                        val pinger = launch {
+                            while (isActive) { pingAt = elapsed(); send("ping"); delay(3000) }
+                        }
+                        try {
+                            for (frame in live.incoming) {
+                                if (frame is Frame.Text) onMessage(Json.parseToJsonElement(frame.readText()).jsonObject)
+                                if (_state.value.roomCode != null) attempts = 0
+                            }
+                        } finally { pinger.cancel() }
+                    } finally { socket = null; withContext(NonCancellable) { live.close() } }
                 }
-
-            is ListenTogetherEvent.Message -> onMessage(event.type, event.payload)
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { _state.update { it.copy(error = "Reconectando a la JAM…") } }
+            if (++attempts > 10) error("No se pudo reconectar. Vuelve a entrar a la JAM")
+            _state.update { it.copy(connection = ConnectionState.Connecting) }
+            delay((attempts * 1000L).coerceAtMost(10_000))
         }
     }
-
-    private fun onMessage(
-        type: String,
-        payload: Any?,
-    ) {
-        when (type) {
-            MessageTypes.ROOM_CREATED -> {
-                val p = payload as? RoomCreatedPayload ?: return
-                _state.update {
-                    it.copy(
-                        roomCode = p.roomCode,
-                        selfUserId = p.userId,
-                        isHost = true,
-                        // The server sends no member list for a brand-new room: the host is alone
-                        // in it, and USER_JOINED carries everyone who arrives afterwards.
-                        members = listOf(RoomMember(p.userId, pendingUsername, isHost = true, isConnected = true)),
-                    )
-                }
-            }
-
-            MessageTypes.JOIN_APPROVED -> {
-                val p = payload as? JoinApprovedPayload ?: return
-                // Ask for the current state explicitly: JoinApproved carries whatever the server
-                // last heard, which is nothing at all if the host has not issued a command yet.
-                launch { client.send(MessageTypes.REQUEST_SYNC, null) }
-                _state.update {
-                    it.copy(
-                        roomCode = p.roomCode,
-                        selfUserId = p.userId,
-                        isHost = false,
-                        pendingJoinCode = null,
-                        members = p.state?.users.orEmpty().map { u -> u.toMember() },
-                        queue = p.state?.queue.orEmpty(),
-                        currentTrack = p.state?.currentTrack,
-                        isPlaying = p.state?.isPlaying ?: false,
-                        position = p.state?.position ?: 0L,
-                    )
-                }
-            }
-
-            MessageTypes.JOIN_REJECTED ->
-                _state.update {
-                    it.copy(
-                        pendingJoinCode = null,
-                        error = (payload as? JoinRejectedPayload)?.reason?.ifBlank { null } ?: "The host declined",
-                    )
-                }
-
-            MessageTypes.JOIN_REQUEST -> {
-                val p = payload as? JoinRequestPayload ?: return
-                if (autoApproveJoins) {
-                    approveJoin(p.userId)
-                    return
-                }
-                _state.update { s ->
-                    if (s.joinRequests.any { it.userId == p.userId }) {
-                        s
-                    } else {
-                        s.copy(joinRequests = s.joinRequests + PendingJoin(p.userId, p.username))
-                    }
-                }
-            }
-
-            MessageTypes.USER_JOINED -> {
-                val p = payload as? UserJoinedPayload ?: return
-                _state.update { s ->
-                    if (s.members.any { it.userId == p.userId }) {
-                        s
-                    } else {
-                        s.copy(members = s.members + RoomMember(p.userId, p.username, isHost = false, isConnected = true))
-                    }
-                }
-            }
-
-            MessageTypes.USER_LEFT -> {
-                val p = payload as? UserLeftPayload ?: return
-                _state.update { s -> s.copy(members = s.members.filterNot { it.userId == p.userId }) }
-            }
-
-            MessageTypes.USER_DISCONNECTED -> {
-                val p = payload as? UserDisconnectedPayload ?: return
-                _state.update { s -> s.copy(members = s.members.map { if (it.userId == p.userId) it.copy(isConnected = false) else it }) }
-            }
-
-            MessageTypes.USER_RECONNECTED -> {
-                val p = payload as? UserReconnectedPayload ?: return
-                _state.update { s -> s.copy(members = s.members.map { if (it.userId == p.userId) it.copy(isConnected = true) else it }) }
-            }
-
-            MessageTypes.HOST_CHANGED -> {
-                val p = payload as? HostChangedPayload ?: return
-                _state.update { s ->
-                    s.copy(
-                        isHost = p.newHostId == s.selfUserId,
-                        members = s.members.map { it.copy(isHost = it.userId == p.newHostId) },
-                    )
-                }
-            }
-
-            MessageTypes.KICKED ->
-                _state.value =
-                    ListenTogetherState(
-                        connection = _state.value.connection,
-                        error = (payload as? KickedPayload)?.reason ?: "Removed from the room",
-                    )
-
-            MessageTypes.BUFFER_WAIT -> {
-                val p = payload as? BufferWaitPayload ?: return
-                _state.update { s ->
-                    s.copy(
-                        waitingFor = p.waitingFor,
-                        members = s.members.map { it.copy(isBuffering = it.userId in p.waitingFor) },
-                    )
-                }
-            }
-
-            MessageTypes.BUFFER_COMPLETE ->
-                _state.update { s -> s.copy(waitingFor = emptyList(), members = s.members.map { it.copy(isBuffering = false) }) }
-
-            MessageTypes.SYNC_STATE -> {
-                val p = payload as? SyncStatePayload ?: return
-                _state.update {
-                    it.copy(
-                        currentTrack = p.currentTrack,
-                        isPlaying = p.isPlaying,
-                        position = p.position,
-                        // Only replace the queue when the server actually sent one — sync_state
-                        // with an empty queue means "nothing to say", not "the queue is empty".
-                        queue = p.queue.ifEmpty { it.queue },
-                    )
-                }
-            }
-
-            MessageTypes.SYNC_PLAYBACK, MessageTypes.PLAYBACK_ACTION -> {
-                val p = payload as? PlaybackActionPayload ?: return
-                _state.update {
-                    it.copy(
-                        currentTrack = p.trackInfo ?: it.currentTrack,
-                        isPlaying =
-                            when (p.action) {
-                                PlaybackActions.PAUSE -> false
-                                PlaybackActions.PLAY -> true
-                                else -> it.isPlaying
-                            },
-                        position = if (p.action == PlaybackActions.SYNC_QUEUE) it.position else p.position,
-                        queue = p.queue.ifEmpty { it.queue },
-                        lastActionServerTime = p.capturedAtServerTime,
-                    )
-                }
-            }
-
-            MessageTypes.SUGGESTION_RECEIVED -> {
-                val p = payload as? SuggestionReceivedPayload ?: return
-                val track = p.trackInfo ?: return
-                if (autoApproveSuggestions) {
-                    approveSuggestion(p.suggestionId)
-                    return
-                }
-                _state.update { s ->
-                    if (s.suggestions.any { it.suggestionId == p.suggestionId }) {
-                        s
-                    } else {
-                        s.copy(suggestions = s.suggestions + PendingSuggestion(p.suggestionId, p.fromUsername, track))
-                    }
-                }
-            }
-
-            MessageTypes.ERROR -> {
-                val p = payload as? ErrorPayload ?: return
-                // `rate_limited` is about one message, not the session, and showing it would put an
-                // alarming banner up for something the user cannot act on.
-                if (p.code != "rate_limited") {
-                    Logger.w(TAG, "Server error ${p.code}: ${p.message}")
-                    // An error while waiting to be let in ends that wait — most often a bad code.
-                    _state.update {
-                        it.copy(pendingJoinCode = null, error = p.message.ifBlank { p.code })
-                    }
-                }
-            }
+    suspend fun send(type: String, block: JsonObjectBuilder.() -> Unit = {}) {
+        socket?.send(Frame.Text(obj { put("type", type); block() }.toString()))
+    }
+    fun command(type: String, block: JsonObjectBuilder.() -> Unit = {}) = launch {
+        try { send(type, block) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { playbackError("Se perdió la conexión con la JAM. Reconectando…") }
+    }
+    private fun onMessage(m: JsonObject) {
+        when (m.string("type")) {
+            "welcome" -> { _state.update { it.copy(selfUserId = m.string("you"), error = null) }; applyState(m.getValue("state").jsonObject) }
+            "state" -> applyState(m.getValue("state").jsonObject)
+            "clock" -> if (m.long("seq") == state.value.seq) _state.update { it.copy(position = (m.getValue("position").jsonPrimitive.double * 1000).toLong(), lastActionServerTime = m.long("server_time"), isPlaying = true) }
+            "pong" -> { val t = m.long("server_time"); clock.recordPong(pingAt, t, t) }
+            "audio" -> audioUrls.update { it + (m.string("video_id") to "$baseUrl${m.string("path")}?t=${m.string("token")}") }
+            "error" -> _state.update { it.copy(error = m.string("message"), pendingJoinCode = null) }
+            "closed" -> { disconnect(); _state.update { it.copy(error = "La JAM se cerró") } }
         }
     }
-
-    /**
-     * The name the user typed, kept so ROOM_CREATED can name the host.
-     *
-     * The server echoes the room code and user id back but not the username it was given, and the
-     * host has to appear in their own member list like everyone else.
-     */
-    private var pendingUsername: String = ""
+    private fun applyState(s: JsonObject) { _state.update { decodeJamState(s, it) } }
+    suspend fun audioUrl(videoId: String): String {
+        audioUrls.update { it - videoId }
+        send("audio") { put("video_id", videoId) }
+        return withTimeout(15_000) { audioUrls.map { it[videoId] }.filterNotNull().first() }
+    }
+    fun serverNow() = clock.now()
+    fun positionAt(position: Long, isPlaying: Boolean) = clock.positionAt(position, state.value.lastActionServerTime, isPlaying)
+    fun reportBufferReady(trackId: String, seq: Long = state.value.seq) = command("ready") { put("seq", seq) }
+    fun requestSync() = command("sync")
+    fun forcePlay() = command("force_play")
+    fun transferHost(userId: String) = command("transfer_host") { put("user_id", userId) }
+    fun removeTrack(qid: Long) = command("queue_remove") { put("qid", qid) }
+    fun moveTrack(qid: Long, to: Int) = command("queue_move") { put("qid", qid); put("to", to) }
+    fun suggestTrack(track: TrackInfo) = command("queue_add") { put("track", encodeJamTrack(track)) }
+    fun playbackError(message: String) { _state.update { it.copy(error = message) } }
+    fun clearError() { _state.update { it.copy(error = null) } }
+    fun cancelJoin() = disconnect()
+    fun leaveRoom() { launch { try { send("leave") } finally { disconnect() } } }
+    fun disconnect() { connection?.cancel(); connection = null; socket = null; audioUrls.value = emptyMap(); _state.value = ListenTogetherState() }
+    fun release() { disconnect(); client.close(); cancel() }
+    fun approveJoin(userId: String) = Unit
+    fun rejectJoin(userId: String) = Unit
+    fun approveSuggestion(suggestionId: String) = Unit
+    fun rejectSuggestion(suggestionId: String) = Unit
+    fun kickUser(userId: String) { _state.update { it.copy(error = "La expulsión no está disponible") } }
+    companion object { const val BASE = "https://killmon.seriepokemon.online" }
 }
 
-private fun UserInfo.toMember() =
-    RoomMember(
-        userId = userId,
-        username = username,
-        isHost = isHost,
-        isConnected = isConnected,
-    )
+internal fun obj(block: JsonObjectBuilder.() -> Unit) = buildJsonObject(block)
+internal fun JsonObject.string(key: String) = (get(key) as? JsonPrimitive)?.contentOrNull.orEmpty()
+internal fun JsonObject.long(key: String) = (get(key) as? JsonPrimitive)?.longOrNull ?: 0L
+internal fun decodeJamTrack(t: JsonObject) = TrackInfo(id = t.string("videoId"), title = t.string("title"), artist = t.string("artist"), duration = t.long("duration_ms"), thumbnail = t.string("thumbnail"))
+internal fun encodeJamTrack(t: TrackInfo) = obj { put("videoId", t.id); put("title", t.title); put("artist", t.artist); put("durationMs", t.duration); put("thumbnail", t.thumbnail) }
+
+internal fun decodeJamState(s: JsonObject, old: ListenTogetherState): ListenTogetherState {
+        val queue = s["queue"]?.jsonArray.orEmpty().map { it.jsonObject }
+        val host = s.string("host_id")
+        val gate = s["gate"] as? JsonObject
+        val waiting = gate?.get("waiting")?.jsonArray.orEmpty().map { it.jsonPrimitive.content }
+        val current = queue.firstOrNull { it.long("qid") == s.long("current_qid") }
+        return old.copy(
+            connection = ConnectionState.Connected("Killmon JAM"), roomCode = s.string("code"), pendingJoinCode = null,
+            isHost = host == old.selfUserId, queue = queue.map(::decodeJamTrack), queueIds = queue.map { it.long("qid") },
+            currentTrack = current?.let(::decodeJamTrack), position = ((s["position"]?.jsonPrimitive?.doubleOrNull ?: 0.0) * 1000).toLong(),
+            isPlaying = s["playing"]?.jsonPrimitive?.booleanOrNull == true, lastActionServerTime = s.long("server_time"),
+            seq = s.long("seq"), loading = s.string("phase") == "loading", gateTimedOut = gate?.get("timed_out")?.jsonPrimitive?.booleanOrNull == true,
+            waitingFor = waiting,
+            members = s["members"]?.jsonArray.orEmpty().map { member -> val u = member.jsonObject
+                RoomMember(u.string("id"), u.string("name"), u.string("id") == host, u["connected"]?.jsonPrimitive?.booleanOrNull == true, u["loading"]?.jsonPrimitive?.booleanOrNull == true)
+            },
+        )
+}

@@ -67,6 +67,8 @@ data class ListenTogetherRoom(
     /** The code we asked to join and have not heard back about. */
     val pendingJoinCode: String? = null,
     val error: String? = null,
+    val gateTimedOut: Boolean = false,
+    val queueIds: List<Long> = emptyList(),
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is RoomConnection.Connected

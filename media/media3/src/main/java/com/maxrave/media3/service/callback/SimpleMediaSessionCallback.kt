@@ -116,6 +116,11 @@ internal class SimpleMediaSessionCallback(
         controller: MediaSession.ControllerInfo,
         playerCommand: Int,
     ): Int {
+        com.maxrave.domain.data.player.JamPlaybackRouter.actions?.let { jam ->
+            if (JamSessionCommands.intercept(playerCommand, session.player.currentPosition, session.player.playWhenReady, jam)) {
+                return SessionError.ERROR_NOT_SUPPORTED
+            }
+        }
         Logger.w(TAG, "Player Command $playerCommand")
         scope.launch {
             when (playerCommand) {

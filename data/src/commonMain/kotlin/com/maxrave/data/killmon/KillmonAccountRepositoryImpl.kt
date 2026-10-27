@@ -110,6 +110,17 @@ internal class KillmonAccountRepositoryImpl(
         }
     }
 
+    override suspend fun jamAccessToken(): String? {
+        var accepted: String? = null
+        authed { token ->
+            when (val check = api.me(token)) {
+                is ApiOutcome.Success -> { accepted = token; ApiOutcome.Success(Unit) }
+                is ApiOutcome.Failure -> check
+            }
+        }
+        return accepted
+    }
+
     override suspend fun login(
         email: String,
         password: String,

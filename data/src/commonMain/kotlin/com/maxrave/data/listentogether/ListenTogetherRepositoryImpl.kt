@@ -103,6 +103,11 @@ class ListenTogetherRepositoryImpl(
         session.requestSync()
     }
 
+    override fun forcePlay() { session.forcePlay() }
+    override fun removeTrack(qid: Long) { session.removeTrack(qid) }
+    override fun moveTrack(qid: Long, to: Int) { session.moveTrack(qid, to) }
+    override fun transport(type: String) { session.command(type) }
+
     override fun clearError() = session.clearError()
 }
 
@@ -122,6 +127,8 @@ private fun ListenTogetherState.toDomain() =
         waitingFor = waitingFor,
         pendingJoinCode = pendingJoinCode,
         error = error,
+        gateTimedOut = gateTimedOut,
+        queueIds = queueIds,
     )
 
 private fun ConnectionState.toDomain(): RoomConnection =
