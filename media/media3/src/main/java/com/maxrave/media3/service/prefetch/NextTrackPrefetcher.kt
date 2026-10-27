@@ -10,6 +10,7 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.SimpleCache
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.extension.now
@@ -51,8 +52,9 @@ import java.util.concurrent.ConcurrentHashMap
 internal class NextTrackPrefetcher(
     context: Context,
     private val scope: CoroutineScope,
-    private val playerCache: Cache,
-    private val downloadCache: Cache,
+    // SimpleCache, not Cache: Koin registers the caches under that class, and looks types up exactly.
+    private val playerCache: SimpleCache,
+    private val downloadCache: SimpleCache,
     private val upstreamFactory: DataSource.Factory,
     private val streamRepository: StreamRepository,
     private val dataStoreManager: DataStoreManager,
