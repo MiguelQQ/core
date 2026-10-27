@@ -34,6 +34,8 @@ import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.logger.Logger
+import com.maxrave.media3.service.prefetch.NextTrackPrefetcher
+import com.maxrave.media3.service.prefetch.PrefetchPolicy
 import com.maxrave.media3.audio.BiquadFilter
 import com.maxrave.media3.audio.ConvolutionReverbAudioProcessor
 import com.maxrave.media3.audio.CrossfadeFilterAudioProcessor
@@ -90,6 +92,8 @@ internal class CrossfadeExoPlayerAdapter(
     private val mediaSourceFactory: MergingMediaSourceFactory,
     private val audioAttributes: AudioAttributes,
     private val streamRepository: StreamRepository,
+    // Writes the next two tracks' audio into the player cache; null leaves only the prepared players.
+    private val prefetcher: NextTrackPrefetcher? = null,
 ) : MediaPlayerInterface {
     // ========== Internal State Enum (same as GstreamerPlayerAdapter) ==========
 
@@ -3131,7 +3135,10 @@ internal class CrossfadeExoPlayerAdapter(
      * and calls prepare(), which triggers URL resolution and buffering via MediaSourceFactory.
      */
     private fun triggerPrecachingInternal() {
-        if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
+        if (!precacheEnabled || playlist.isEmpty() || isCastActive) {
+            prefetcher?.cancelAll()
+            return
+        }
 
         cancelPrecaching()
         Logger.d(TAG, "Trigger precache")
@@ -3140,19 +3147,10 @@ internal class CrossfadeExoPlayerAdapter(
                 try {
                     val indicesToPrecache = mutableListOf<Int>()
 
-                    val index = localCurrentMediaItemIndex
-                    for (i in 1..maxPrecacheCount) {
-                        val nextIndex =
-                            when (internalRepeatMode) {
-                                PlayerConstants.REPEAT_MODE_ALL -> {
-                                    (index + i) % playlist.size
-                                }
-                                else -> {
-                                    val next = index + i
-                                    if (next < playlist.size) next else break
-                                }
-                            }
-
+                    // Play order, so shuffle prepares the tracks that really come next.
+                    val upcoming = upcomingIndices()
+                    prefetcher?.update(upcoming.mapNotNull { playlist.getOrNull(it)?.mediaId })
+                    for (nextIndex in upcoming) {
                         val nextVideoId = playlist.getOrNull(nextIndex)?.mediaId
                         // A live broadcast is not precached: buffered ahead, it would start behind
                         // the live edge by however long it waited in the queue.
@@ -3194,6 +3192,19 @@ internal class CrossfadeExoPlayerAdapter(
         precacheJob = null
     }
 
+    /** The next [maxPrecacheCount] playlist indices in play order (shuffle and repeat-all aware). */
+    private fun upcomingIndices(): List<Int> {
+        if (internalRepeatMode == PlayerConstants.REPEAT_MODE_ONE) return emptyList()
+        return PrefetchPolicy.upcomingIndices(
+            size = playlist.size,
+            current = localCurrentMediaItemIndex,
+            count = maxPrecacheCount,
+            repeatAll = internalRepeatMode == PlayerConstants.REPEAT_MODE_ALL,
+            shuffleOrder = if (internalShuffleModeEnabled) shuffleOrder.toList() else null,
+            shuffleIndices = if (internalShuffleModeEnabled) shuffleIndices.toList() else null,
+        )
+    }
+
     private fun clearPrecacheExceptCurrentInternal() {
         Logger.d(TAG, "Clearing precache")
         precachedPlayers.entries.removeIf { (videoId, cached) ->
@@ -3208,6 +3219,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     private fun clearAllPrecacheInternal() {
         Logger.d(TAG, "Clearing all precache")
+        prefetcher?.cancelAll()
         precachedPlayers.values.forEach { cleanupPlayerInternal(it.player) }
         precachedPlayers.clear()
     }
