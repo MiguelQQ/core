@@ -236,6 +236,9 @@ internal class CrossfadeExoPlayerAdapter(
     @Volatile
     private var hasAudioFocus = false
 
+    @Volatile
+    override var audioFocusLost: Boolean = false
+
     /** True when focus was lost transiently so playback should auto-resume on regain. */
     @Volatile
     private var resumeOnFocusGain = false
@@ -244,6 +247,7 @@ internal class CrossfadeExoPlayerAdapter(
         AudioManager.OnAudioFocusChangeListener { focusChange ->
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_GAIN -> {
+                    audioFocusLost = false
                     // Don't fight the crossfade ramp; while crossfading it owns the volume.
                     if (!isCrossfading) currentPlayer?.volume = internalVolume
                     if (resumeOnFocusGain) {
@@ -256,12 +260,14 @@ internal class CrossfadeExoPlayerAdapter(
                     // Permanent loss (another app took over): pause and stop tracking focus.
                     resumeOnFocusGain = false
                     hasAudioFocus = false
+                    audioFocusLost = true
                     pause()
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                     // Temporary loss (e.g. an incoming call): pause and remember to resume.
                     resumeOnFocusGain = internalState == InternalState.PLAYING
+                    audioFocusLost = true
                     pause()
                 }
 
@@ -293,6 +299,7 @@ internal class CrossfadeExoPlayerAdapter(
         if (hasAudioFocus) return true
         val granted = am.requestAudioFocus(audioFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         hasAudioFocus = granted
+        if (granted) audioFocusLost = false
         Logger.d(TAG, "requestAudioFocus -> granted=$granted")
         return granted
     }
@@ -931,6 +938,31 @@ internal class CrossfadeExoPlayerAdapter(
 
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
             loadAndPlayTrackInternal(0, 0, internalPlayWhenReady)
+        }
+    }
+
+    override fun setMediaItem(
+        mediaItem: GenericMediaItem,
+        startPositionMs: Long,
+    ) {
+        cachedPosition = startPositionMs.coerceAtLeast(0L)
+        coroutineScope.launch {
+            currentLoadJob?.cancel()
+            cancelPrecaching()
+
+            playlist.clear()
+            clearAllPrecacheInternal()
+            playlist.add(mediaItem)
+            localCurrentMediaItemIndex = 0
+
+            if (internalShuffleModeEnabled) {
+                createShuffleOrder()
+            }
+
+            notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
+            // Paused at the requested second: the room decides when anything starts to sound.
+            internalPlayWhenReady = false
+            loadAndPlayTrackInternal(0, startPositionMs.coerceAtLeast(0L), false)
         }
     }
 

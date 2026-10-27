@@ -864,10 +864,14 @@ internal class MediaServiceHandlerImpl(
     }
 
     private fun updateNextPreviousTrackAvailability() {
+        val inRoom = JamPlaybackRouter.actions != null
+        // A room's player holds one item; next / previous are the room's queue.
+        val roomIndex = if (inRoom) currentOrderIndex() else -1
+        val roomSize = queueData.value.data.listTracks.size
         _controlState.value =
             _controlState.value.copy(
-                isNextAvailable = player.hasNextMediaItem(),
-                isPreviousAvailable = player.hasPreviousMediaItem(),
+                isNextAvailable = if (inRoom) roomIndex in 0 until roomSize - 1 else player.hasNextMediaItem(),
+                isPreviousAvailable = if (inRoom) roomIndex > 0 else player.hasPreviousMediaItem(),
             )
     }
 
@@ -2203,7 +2207,11 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun currentOrderIndex(): Int =
-        if (player.shuffleModeEnabled) {
+        if (JamPlaybackRouter.actions != null) {
+            // The player holds the one item the room selected; its place is in the mirrored room queue.
+            val id = player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO)
+            queueData.value.data.listTracks.indexOfFirst { it.videoId == id }.coerceAtLeast(0)
+        } else if (player.shuffleModeEnabled) {
             queueData.value.data.listTracks.indexOfLast {
                 it.videoId == player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO)
             }

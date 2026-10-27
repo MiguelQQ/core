@@ -89,6 +89,8 @@ data class ListenTogetherState(
     val gateTimedOut: Boolean = false,
     val queueIds: List<Long> = emptyList(),
     val queueContributors: List<String> = emptyList(),
+    /** Parallel to [queue]: true when the member who added the track picked its video. */
+    val queueIsVideo: List<Boolean> = emptyList(),
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is ConnectionState.Connected
@@ -110,7 +112,7 @@ class ListenTogetherSession internal constructor(
 
     override val coroutineContext = SupervisorJob() + dispatcher
     private val client = HttpClient(getEngine()) {
-        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.14" }
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.15" }
         install(WebSockets)
         install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
     }
@@ -124,14 +126,20 @@ class ListenTogetherSession internal constructor(
     private var pingAt = 0L
     private var forcedSeq = -1L
     private var failedSeq = -1L
-    private val additions = Channel<Triple<String, TrackInfo, Boolean>>(Channel.UNLIMITED)
+    private class Addition(val code: String, val track: TrackInfo, val play: Boolean, val isVideo: Boolean, val after: String?)
+    private val additions = Channel<Addition>(Channel.UNLIMITED)
     init {
         launch {
-            for ((code, track, play) in additions) {
+            for (addition in additions) {
+                val code = addition.code
                 state.first { it.roomCode != code || it.isConnected }
                 if (state.value.roomCode != code) continue
                 try {
-                    send("queue_add") { put("track", encodeJamTrack(track)); if (play) put("play", true) }
+                    send("queue_add") {
+                        put("track", encodeJamTrack(addition.track, addition.isVideo))
+                        if (addition.play) put("play", true)
+                        addition.after?.let { put("after", it) }
+                    }
                 } catch (e: CancellationException) { throw e }
                 catch (e: Exception) { playbackError("No se pudo añadir la canción. Comprueba la conexión con la JAM.") }
                 // Keep playlist additions below S2's 60 messages/10 s, leaving room for pos/ping.
@@ -258,9 +266,13 @@ class ListenTogetherSession internal constructor(
     fun transferHost(userId: String) = command("transfer_host") { put("user_id", userId) }
     fun removeTrack(qid: Long) = command("queue_remove") { put("qid", qid) }
     fun moveTrack(qid: Long, to: Int) = command("queue_move") { put("qid", qid); put("to", to) }
-    fun suggestTrack(track: TrackInfo, play: Boolean = false) {
+    /**
+     * [after] is the videoId of a queued track this one goes right behind; without it a plain add goes
+     * to the end and a [play] add goes right behind the track that is playing now.
+     */
+    fun suggestTrack(track: TrackInfo, play: Boolean = false, isVideo: Boolean = false, after: String? = null) {
         val code = state.value.roomCode ?: return
-        additions.trySend(Triple(code, track, play))
+        additions.trySend(Addition(code, track, play, isVideo, after))
     }
     fun playbackError(message: String) { _state.update { it.copy(error = message) } }
     fun clearError() { _state.update { it.copy(error = null) } }
@@ -280,7 +292,10 @@ internal fun obj(block: JsonObjectBuilder.() -> Unit) = buildJsonObject(block)
 internal fun JsonObject.string(key: String) = (get(key) as? JsonPrimitive)?.contentOrNull.orEmpty()
 internal fun JsonObject.long(key: String) = (get(key) as? JsonPrimitive)?.longOrNull ?: 0L
 internal fun decodeJamTrack(t: JsonObject) = TrackInfo(id = t.string("videoId"), title = t.string("title"), artist = t.string("artist"), duration = t.long("duration_ms"), thumbnail = t.string("thumbnail"))
-internal fun encodeJamTrack(t: TrackInfo) = obj { put("videoId", t.id); put("title", t.title); put("artist", t.artist); put("durationMs", t.duration); put("thumbnail", t.thumbnail) }
+internal fun encodeJamTrack(t: TrackInfo, isVideo: Boolean = false) = obj {
+    put("videoId", t.id); put("title", t.title); put("artist", t.artist); put("durationMs", t.duration); put("thumbnail", t.thumbnail)
+    if (isVideo) put("isVideo", true)
+}
 
 internal fun decodeJamState(s: JsonObject, old: ListenTogetherState): ListenTogetherState {
         val queue = s["queue"]?.jsonArray.orEmpty().map { it.jsonObject }
@@ -291,6 +306,7 @@ internal fun decodeJamState(s: JsonObject, old: ListenTogetherState): ListenToge
         return old.copy(
             connection = ConnectionState.Connected("Killmon JAM"), roomCode = s.string("code"), pendingJoinCode = null,
             isHost = host == old.selfUserId, queue = queue.map(::decodeJamTrack), queueIds = queue.map { it.long("qid") }, queueContributors = queue.map { it.string("added_by") },
+            queueIsVideo = queue.map { (it["is_video"] as? JsonPrimitive)?.booleanOrNull == true },
             currentTrack = current?.let(::decodeJamTrack), position = ((s["position"]?.jsonPrimitive?.doubleOrNull ?: 0.0) * 1000).toLong(),
             isPlaying = s["playing"]?.jsonPrimitive?.booleanOrNull == true, lastActionServerTime = s.long("server_time"),
             seq = s.long("seq"), loading = s.string("phase") == "loading", gateTimedOut = gate?.get("timed_out")?.jsonPrimitive?.booleanOrNull == true,

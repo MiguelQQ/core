@@ -74,6 +74,13 @@ data class ListenTogetherRoom(
     val loading: Boolean = false,
 ) {
     val inRoom: Boolean get() = roomCode != null
+
+    /**
+     * The spinner mini-player and full player show: the player's own, or the room holding everybody
+     * at the load gate. The phone that is already playing has an idle, ready player at that moment,
+     * so without the room's flag it sat silent with nothing on screen saying why.
+     */
+    fun showsLoading(playerLoading: Boolean): Boolean = playerLoading || (inRoom && loading)
     val isConnected: Boolean get() = connection is RoomConnection.Connected
 
     /** Names, not ids — "Waiting for Long" is the only useful phrasing of the barrier. */
