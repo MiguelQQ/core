@@ -93,11 +93,25 @@ class ConnectPlaybackPolicyTest {
         assertEquals(0.3f, newHandleVolume(0.3f))
         assertTrue(newHandleVolume(0.3f) != 1f)
         val held = mpvGainWrite(masterPercent = 30, fadePercent = 100, sleepPercent = 100, outputReady = false)
-        assertEquals(0.0, held.softwareVolume)
+        assertEquals(30.0, held.softwareVolume)
+        assertEquals(100.0, held.aoVolume)
         assertTrue(held.softwareVolume != 100.0)
         val live = mpvGainWrite(masterPercent = 30, fadePercent = 100, sleepPercent = 100, outputReady = true)
-        assertEquals(30.0, live.aoVolume)
-        assertEquals(100.0, live.softwareVolume)
+        assertEquals(100.0, live.aoVolume)
+        assertEquals(30.0, live.softwareVolume)
+        assertEquals(0.0, mpvGainWrite(30, 0, 100, outputReady = true).softwareVolume)
+        assertEquals(15.0, mpvGainWrite(30, 100, 50, outputReady = true).softwareVolume)
+        val api037 = (2L shl 16) or 2L
+        val api038 = (2L shl 16) or 3L
+        assertEquals(
+            listOf("loadfile", "https://a", "replace", "volume=30.0000,pause=yes"),
+            mpvLoadFileArgs("https://a", mpvVolumeText(30.0), api037),
+        )
+        assertEquals(
+            listOf("loadfile", "https://a", "replace", "0", "volume=30.0000,pause=yes"),
+            mpvLoadFileArgs("https://a", mpvVolumeText(held.softwareVolume), api038),
+        )
+        assertEquals("0.0000", mpvVolumeText(0.0))
         val incoming = incomingHandleOrder()
         assertEquals(HandleStep.APPLY_LEVELS, incoming.first())
         assertTrue(incoming.indexOf(HandleStep.LOAD_FILE) > incoming.indexOf(HandleStep.MUTE))

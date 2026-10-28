@@ -1161,8 +1161,12 @@ class JvmMediaPlayerHandlerImpl(
     override suspend fun onPlayerEvent(playerEvent: PlayerEvent) {
         when (playerEvent) {
             is PlayerEvent.UpdateVolume -> {
-                Logger.w(TAG, "onPlayerEvent: UpdateVolume ${playerEvent.newVolume}")
-                player.volume = playerEvent.newVolume
+                val level = playerEvent.newVolume.coerceIn(0f, 1f)
+                Logger.w(TAG, "onPlayerEvent: UpdateVolume $level")
+                // Publish before the mpv write. The slider reads this; waiting for the listener
+                // left the thumb on the previous value for the whole gesture.
+                _controlState.update { it.copy(volume = level) }
+                player.volume = level
             }
 
             PlayerEvent.Backward -> {

@@ -141,26 +141,76 @@ data class MpvGainWrite(
 )
 
 /**
- * Con el AO todavía sin crear, el volumen de software queda en 0.
- * Si no, el mixer nace a 100 y el primer buffer sale a tope.
- * Con el AO listo, `ao-volume` es el master del usuario y el software es solo el fade.
+ * Ganancia audible entera, 0–100. 100 en cada factor es unidad.
+ * `master * fade * sleep / 10000`: 30×100×100 → 30.
+ */
+fun mpvSoftwarePercent(
+    masterPercent: Int,
+    fadePercent: Int,
+    sleepPercent: Int,
+): Double {
+    val master = masterPercent.coerceIn(0, 100)
+    val fade = fadePercent.coerceIn(0, 100)
+    val sleep = sleepPercent.coerceIn(0, 100)
+    return master * fade * sleep / 10000.0
+}
+
+/**
+ * Texto de una opción de mpv: punto decimal, cuatro decimales.
+ * 30.0 → `30.0000`.
+ */
+fun mpvVolumeText(percent: Double): String {
+    val scaled = kotlin.math.round(percent.coerceIn(0.0, 100.0) * 10000.0).toLong()
+    val whole = scaled / 10000
+    val frac = kotlin.math.abs(scaled % 10000).toString().padStart(4, '0')
+    return "$whole.$frac"
+}
+
+/**
+ * mpv 0.38 (client API 2.3) metió un índice delante de las opciones de `loadfile`.
+ * 0.37 (API 2.2) trata ese tercer argumento como la cadena de opciones.
+ */
+fun mpvClientApiInsertsLoadFileIndex(clientApiVersion: Long): Boolean {
+    val major = (clientApiVersion ushr 16) and 0xFFFF
+    val minor = clientApiVersion and 0xFFFF
+    return major > 2L || (major == 2L && minor >= 3L)
+}
+
+/**
+ * `loadfile` en pausa y con el volumen de software ya puesto.
+ * El índice solo aparece en API ≥ 2.3; en `replace` mpv lo ignora.
+ */
+fun mpvLoadFileArgs(
+    url: String,
+    volumeText: String,
+    clientApiVersion: Long,
+): List<String> {
+    val options = "volume=$volumeText,pause=yes"
+    return if (mpvClientApiInsertsLoadFileIndex(clientApiVersion)) {
+        listOf("loadfile", url, "replace", "0", options)
+    } else {
+        listOf("loadfile", url, "replace", options)
+    }
+}
+
+/**
+ * El software lleva toda la ganancia audible y `ao-volume` se queda en 100.
+ *
+ * [outputReady] no cambia el reparto: si al aparecer el AO el software pasa de
+ * 0 a 100 y el mixer baja al usuario, el buffer que ya salió a tope se oye
+ * unos dos segundos. La unidad en el mixer tampoco es un golpe cuando Windows
+ * reinicia la sesión WASAPI compartida a 100.
  */
 fun mpvGainWrite(
     masterPercent: Int,
     fadePercent: Int,
     sleepPercent: Int,
-    outputReady: Boolean,
-): MpvGainWrite {
-    val master = masterPercent.coerceIn(0, 100)
-    val fade = fadePercent.coerceIn(0, 100)
-    val sleep = sleepPercent.coerceIn(0, 100)
-    val ao = master * sleep / 100.0
-    return if (outputReady) {
-        MpvGainWrite(aoVolume = ao, softwareVolume = fade.toDouble())
-    } else {
-        MpvGainWrite(aoVolume = ao, softwareVolume = 0.0)
-    }
-}
+    @Suppress("UNUSED_PARAMETER") outputReady: Boolean,
+): MpvGainWrite =
+    MpvGainWrite(
+        aoVolume = 100.0,
+        softwareVolume = mpvSoftwarePercent(masterPercent, fadePercent, sleepPercent),
+    )
 
 /** Normalización apagada: no hay escritura. El 1f del player no sustituye al usuario. */
 fun volumeWriteWhenNormalizeOff(): Float? = null

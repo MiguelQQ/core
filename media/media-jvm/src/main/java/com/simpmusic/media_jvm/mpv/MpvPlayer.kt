@@ -1,6 +1,8 @@
 package com.simpmusic.media_jvm.mpv
 
 import com.maxrave.domain.data.model.connect.mpvGainWrite
+import com.maxrave.domain.data.model.connect.mpvLoadFileArgs
+import com.maxrave.domain.data.model.connect.mpvVolumeText
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.logger.Logger
 import com.sun.jna.Memory
@@ -244,11 +246,15 @@ class MpvPlayer private constructor(
             // surfaces as MPV_EVENT_END_FILE instead of MPV_EVENT_SHUTDOWN.
             option("idle", "yes")
             option("audio-client-name", "Killmon Music")
-            // Software gain stays at 0 until AUDIO_RECONFIG. A new AO otherwise emits the first
-            // buffers at the property default (100) before the user's master can be written.
+            // Software gain is the audible level from the first sample. ao-volume stays at unity
+            // so a shared WASAPI session reset to 100 is not a spike, and the two controls do
+            // not multiply the user's level twice. Fade 0 (a handle that is not current yet)
+            // keeps this at 0 until the crossfade ramp asks for more.
             val masterOption = initialMasterPercent.coerceIn(0, 100)
-            option("volume", "0")
-            optionalOption("ao-volume", masterOption.toString())
+            val fadeOption = initialFadePercent.coerceIn(0, 100)
+            val opening = mpvGainWrite(masterOption, fadeOption, 100, outputReady = false)
+            option("volume", mpvVolumeText(opening.softwareVolume))
+            optionalOption("ao-volume", mpvVolumeText(opening.aoVolume))
 
             // macOS only: keep mpv off ao_coreaudio, which leaks a process-wide CoreAudio
             // listener pointing at a freed `struct ao` and takes the whole JVM down the next
@@ -385,7 +391,7 @@ class MpvPlayer private constructor(
             }
 
             return MpvPlayer(ctx, lib, frameSource).also {
-                it.primeLevels(masterOption, initialFadePercent.coerceIn(0, 100), 100)
+                it.primeLevels(masterOption, fadeOption, 100)
                 it.start()
             }
         }
@@ -495,12 +501,6 @@ class MpvPlayer private constructor(
     private fun dispatch(event: MpvEvent) {
         val listener = eventListener
         when (event.event_id) {
-            MpvEventId.START_FILE -> {
-                playbackRestarted = false
-                lastEmittedPlaying = null
-                listener?.opening(this)
-            }
-
             MpvEventId.END_FILE -> {
                 playbackRestarted = false
                 lastEmittedPlaying = null
@@ -520,11 +520,24 @@ class MpvPlayer private constructor(
                 }
             }
 
+            MpvEventId.START_FILE -> {
+                playbackRestarted = false
+                lastEmittedPlaying = null
+                if (awaitStart) {
+                    awaitStart = false
+                    awaitLatch = true
+                }
+                listener?.opening(this)
+            }
+
+            MpvEventId.FILE_LOADED -> releaseLoadLatch()
+
             MpvEventId.AUDIO_RECONFIG -> {
-                // The audio output was just (re)created, and `ao-volume` only becomes settable once
-                // it exists. Apply master and fade together in this same call. A separate write
-                // would leave one frame at the mixer default (100).
+                // The audio output was just (re)created. Write the same software gain the
+                // loadfile option already used, then unpause. A later split (software 100,
+                // ao-volume = user) leaves the AO buffer loud for about two seconds.
                 applyVolume()
+                releaseLoadLatch()
             }
 
             MpvEventId.PLAYBACK_RESTART -> {
@@ -590,44 +603,64 @@ class MpvPlayer private constructor(
     // ================= transport =================
 
     /**
-     * Load [url] and begin playback, or load it held at the first frame when [startPaused].
+     * Load [url], held paused until [FILE_LOADED] or [AUDIO_RECONFIG] rewrites the same software
+     * gain and, when the caller wants playback, clears pause.
      *
-     * mpv collapses vlcj's `media().play()`, `media().startPaused()` and `media().prepare()` into
-     * one `loadfile` — the `pause` property decides which of the three it behaves as.
-     *
-     * Deliberately uses the 3-argument form `loadfile <url> replace`, which is unambiguous on
-     * every mpv version. The trailing parameters are NOT stable across releases:
-     *  - 0.37.0 (our target) documents `loadfile <url> [<flags> [<options>]]` — the third
-     *    argument is the per-file OPTION STRING.
-     *  - 0.38.0 inserted `<index>` ahead of it: `loadfile <url> [<flags> [<index> [<options>]]]`.
-     *
-     * So anything past `<flags>` would mean different things on different builds. Per-file options
-     * are unnecessary here regardless: one handle serves exactly one media item, so they are set
-     * on the handle itself in [create] — the same role VLC's `:option` media arguments played.
+     * `loadfile` resets `volume` to 100. The per-file option puts the user's gain on the first
+     * sample. The argument shape depends on the client API: 0.37 takes the option string as the
+     * third argument; 0.38 inserts an index in front of it. See [mpvLoadFileArgs].
      */
     fun loadFile(
         url: String,
         startPaused: Boolean,
     ) {
         if (isReleased) return
-        setPropertyString("pause", if (startPaused) "yes" else "no")
-        if (!aoVolumeWritable) setPropertyDouble("volume", 0.0)
-        command("loadfile", url, "replace")
+        awaitStart = true
+        awaitLatch = false
+        resumeAfterLoad = !startPaused
+        setPropertyString("pause", "yes")
+        val gain = currentGain()
+        // Software first. Writing ao-volume up to 100 while software is still 100 is the spike.
+        setPropertyDouble("volume", gain.softwareVolume)
+        setPropertyDouble("ao-volume", gain.aoVolume, logFailure = false)
+        val api =
+            try {
+                lib.mpv_client_api_version()
+            } catch (e: Throwable) {
+                Logger.w(TAG, "mpv_client_api_version failed: ${e.message}")
+                (2L shl 16) or 2L
+            }
+        val args = mpvLoadFileArgs(url, mpvVolumeText(gain.softwareVolume), api)
+        command(*args.toTypedArray())
+        setPropertyDouble("volume", gain.softwareVolume)
     }
 
     fun play() {
         if (isReleased) return
-        setPropertyString("pause", "no")
+        resumeAfterLoad = true
+        if (!awaitStart && !awaitLatch) setPropertyString("pause", "no")
     }
 
     fun pause() {
         if (isReleased) return
+        resumeAfterLoad = false
         setPropertyString("pause", "yes")
     }
 
     fun stop() {
         if (isReleased) return
+        resumeAfterLoad = false
+        awaitStart = false
+        awaitLatch = false
         command("stop")
+    }
+
+    /** Unpause only after this load's START_FILE, so a stale event cannot open the previous file. */
+    private fun releaseLoadLatch() {
+        if (!awaitLatch) return
+        awaitLatch = false
+        applyVolume()
+        if (resumeAfterLoad) setPropertyString("pause", "no")
     }
 
     // Volume is split in three so each owner can move its own level without disturbing the others:
@@ -651,9 +684,26 @@ class MpvPlayer private constructor(
     @Volatile
     private var sleepPercent = 100
 
-    /** False until `ao-volume` has been accepted. Until then the software gain stays at 0. */
+    /** False until `ao-volume` has been accepted. The gain split does not change when it flips. */
     @Volatile
     private var aoVolumeWritable = false
+
+    /** True from [loadFile] until that load's START_FILE. Stale FILE_LOADED events stay ignored. */
+    @Volatile
+    private var awaitStart = false
+
+    /** True after START_FILE until the software gain is written and playback may resume. */
+    @Volatile
+    private var awaitLatch = false
+
+    /** The caller asked this load to be heard, not held at the first frame. */
+    @Volatile
+    private var resumeAfterLoad = false
+
+    private fun currentGain() =
+        synchronized(volumeLock) {
+            mpvGainWrite(masterPercent, fadePercent, sleepPercent, outputReady = aoVolumeWritable)
+        }
 
     internal fun primeLevels(
         master: Int,
@@ -695,10 +745,9 @@ class MpvPlayer private constructor(
     /**
      * The sleep timer's fade-out, 0..100 where 100 means "no attenuation".
      *
-     * Rides on the master rather than on [setFadeVolume] for two reasons: the crossfade ramp is
-     * reset to 100 every time a handle becomes current, which would wipe a fade still in progress,
-     * and the master reaches the device mixer, so it takes effect immediately instead of trailing
-     * the audio-output buffer by a second or two — a ramp measured in seconds cannot afford that lag.
+     * Kept off [setFadeVolume]: the crossfade ramp is reset to 100 every time a handle becomes
+     * current, which would wipe a fade still in progress. It rides on the software gain together
+     * with the user's level (`ao-volume` stays at unity).
      */
     fun setSleepFadeVolume(volume: Int) {
         if (isReleased) return
@@ -729,26 +778,20 @@ class MpvPlayer private constructor(
     }
 
     /**
-     * `volume` is mpv's *software* volume: applied inside the filter chain, so audio already queued
-     * in the audio-output buffer keeps playing at the previous level — audible as a couple of
-     * seconds of lag after the slider is released. `ao-volume` drives the audio device's own mixer
-     * and takes effect immediately, so the master and the sleep fade ride on that and the software
-     * volume is left to carry the crossfade ramp alone (mpv applies the two independently — they
-     * multiply). When the audio output exposes no mixer control, all three collapse into the
-     * software volume so the user's level is still honoured.
+     * `volume` is mpv's software volume. It carries the whole audible gain (user × fade × sleep)
+     * so a new file never starts at 100. `ao-volume` stays at 100: the two multiply, and a
+     * shared Windows mixer reset to 100 must not be a spike. Software is written first so a
+     * handle that still has the old split dips for a moment instead of jumping to full.
      */
     private fun applyVolume() =
         synchronized(volumeLock) {
             val write = mpvGainWrite(masterPercent, fadePercent, sleepPercent, outputReady = aoVolumeWritable)
+            setPropertyDouble("volume", write.softwareVolume)
             if (!aoVolumeWritable && setPropertyDouble("ao-volume", write.aoVolume, logFailure = false) >= 0) {
                 aoVolumeWritable = true
             }
-            val applied = mpvGainWrite(masterPercent, fadePercent, sleepPercent, outputReady = aoVolumeWritable)
             if (aoVolumeWritable) {
-                setPropertyDouble("ao-volume", applied.aoVolume, logFailure = false)
-                setPropertyDouble("volume", applied.softwareVolume)
-            } else {
-                setPropertyDouble("volume", applied.softwareVolume)
+                setPropertyDouble("ao-volume", write.aoVolume, logFailure = false)
             }
         }
 
