@@ -45,7 +45,59 @@ data class ConnectSession(
             positionMs = positionMs.coerceAtLeast(0L),
             isPlaying = isPlaying,
         )
+
+    /**
+     * El mismo contrato que el servidor: play, pause, seek, next y previous.
+     * La posición estimada se sella en [nowMs] para que la UI no espere al latido.
+     */
+    fun withControl(
+        action: String,
+        requestedPositionMs: Long?,
+        nowMs: Long,
+    ): ConnectSession {
+        val estimated = estimatedPositionMs(nowMs)
+        var nextIndex = index
+        var nextPosition = estimated
+        var playing = isPlaying
+        when (action) {
+            "play" -> playing = true
+            "pause" -> playing = false
+            "seek" -> {
+                val requested = requestedPositionMs ?: return this
+                if (requested < 0L) return this
+                nextPosition = requested
+            }
+            "next" -> {
+                if (index < queue.lastIndex) {
+                    nextIndex = index + 1
+                    nextPosition = 0L
+                }
+            }
+            "previous" -> {
+                if (estimated > 3_000L) {
+                    nextPosition = 0L
+                } else if (index > 0) {
+                    nextIndex = index - 1
+                    nextPosition = 0L
+                } else {
+                    nextPosition = 0L
+                }
+            }
+            else -> return this
+        }
+        val cap = queue.getOrNull(nextIndex)?.durationMs ?: 0L
+        if (cap > 0L) nextPosition = nextPosition.coerceAtMost(cap)
+        return copy(
+            index = nextIndex,
+            positionMs = nextPosition,
+            positionAtMs = nowMs,
+            isPlaying = playing,
+        )
+    }
 }
+
+/** Con sesión o con otro aparato en línea el latido es corto: pausa y seek no pueden esperar 8 s. */
+fun connectPollIntervalMs(sessionLive: Boolean): Long = if (sessionLive) 1_000L else 8_000L
 
 data class ConnectDevice(
     val deviceId: String,
@@ -75,5 +127,12 @@ data class ConnectState(
     fun isFollowingRemote(): Boolean {
         val current = session ?: return false
         return signedIn && current.activeDeviceId != deviceId && current.queue.isNotEmpty()
+    }
+
+    /** Este aparato es el que suena, o todavía no hay sesión y puede publicarla. Una sala JAM no. */
+    fun publishesLocalAudio(inJam: Boolean): Boolean {
+        if (!signedIn || inJam) return false
+        val active = session?.activeDeviceId
+        return active == null || active == deviceId
     }
 }

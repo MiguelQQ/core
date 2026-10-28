@@ -126,6 +126,11 @@ internal class AccountConnectRepositoryImpl(
     ) {
         scope.launch {
             if (!ready || accounts.session.value == null) return@launch
+            val now = Clock.System.now().toEpochMilliseconds()
+            _state.value.session?.let { current ->
+                val next = current.withControl(action, positionMs, now)
+                if (next != current) _state.value = _state.value.copy(session = next)
+            }
             when (
                 val outcome =
                     accounts.withAccess { token ->

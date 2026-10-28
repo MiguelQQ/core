@@ -4,9 +4,11 @@ package com.maxrave.data.killmon
 
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.connect.ConnectCommand
 import com.maxrave.domain.data.model.connect.ConnectPlayback
 import com.maxrave.domain.data.model.connect.ConnectSession
 import com.maxrave.domain.data.model.connect.ConnectTrack
+import com.maxrave.domain.data.model.connect.connectPollIntervalMs
 import com.maxrave.domain.data.model.searchResult.songs.Artist
 import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
 import com.maxrave.domain.data.player.GenericMediaItem
@@ -14,6 +16,7 @@ import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
 import com.maxrave.domain.mediaservice.handler.PlaylistType
 import com.maxrave.domain.mediaservice.handler.QueueData
+import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
 import kotlin.time.Clock
@@ -38,13 +41,27 @@ internal class ConnectPlaybackBridge(
     private var started = false
     private var wasPlaying = false
     private var applying = false
+    private var silenced = false
     private var ackedTransfer = 0L
     private var ackedControl = 0L
     private var mirroredKey: String? = null
+    private var lastPlayerKickMs = 0L
 
     fun start() {
         if (started) return
         started = true
+        handler.player.addListener(
+            object : MediaPlayerListener {
+                override fun onIsPlayingChanged(isPlaying: Boolean) = kickFromPlayer()
+
+                override fun onSeeked(positionMs: Long) = kickFromPlayer()
+
+                override fun onMediaItemTransition(
+                    mediaItem: GenericMediaItem?,
+                    reason: Int,
+                ) = kickFromPlayer()
+            },
+        )
         scope.launch {
             while (isActive) {
                 if (connect.ensureReady()) break
@@ -52,7 +69,6 @@ internal class ConnectPlaybackBridge(
             }
             wasPlaying = withContext(Dispatchers.Main) { handler.player.playWhenReady }
             while (isActive) {
-                connect.awaitKick(HEARTBEAT_MS)
                 try {
                     step()
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -60,14 +76,22 @@ internal class ConnectPlaybackBridge(
                 } catch (e: Exception) {
                     Logger.e(TAG, "No se pudo sincronizar el dispositivo", e)
                 }
+                val live = connect.state.value.let { it.session != null || it.devices.size > 1 }
+                connect.awaitKick(connectPollIntervalMs(live))
             }
         }
     }
 
+    private fun kickFromPlayer() {
+        if (applying) return
+        val now = Clock.System.now().toEpochMilliseconds()
+        if (now - lastPlayerKickMs < 400L) return
+        lastPlayerKickMs = now
+        connect.refresh()
+    }
+
     private suspend fun step() {
         val inJam = jam.room.value.inRoom
-        val local = withContext(Dispatchers.Main) { localPlayback() }
-        connect.localPlayback = local
         val before = connect.state.value
         val playing = withContext(Dispatchers.Main) { handler.player.playWhenReady }
         val edge = playing && !wasPlaying && !applying
@@ -75,46 +99,71 @@ internal class ConnectPlaybackBridge(
         val active = before.session?.activeDeviceId
         // Play local mientras se sigue al otro aparato: eso trae la sesión aquí, no publica la cola vieja.
         if (edge && !inJam && active != null && active != before.deviceId && before.isFollowingRemote()) {
-            // El play local no debe soltar la cola vieja: se pausa y se pide la sesión remota.
             yieldLocal()
             connect.transferTo(before.deviceId)
             return
         }
-        val pending = before.command
-        val pendingSession = before.session
-        if (!inJam && pending?.type == "transfer" && pendingSession != null && pending.revision > ackedTransfer) {
-            applyTransfer(pendingSession)
-            ackedTransfer = pending.revision
-            wasPlaying = pendingSession.isPlaying
-            connect.exchange(ConnectReport(ackTransfer = ackedTransfer))
-            return
-        }
-        val publish = !inJam && local != null && (active == null || active == before.deviceId)
-        connect.exchange(
-            ConnectReport(
-                playback = if (publish) local else null,
-                ackTransfer = ackedTransfer.takeIf { it > 0L },
-                ackControl = ackedControl.takeIf { it > 0L },
-            ),
-        )
+        if (!inJam && applyPending(before.command, before.session, before.deviceId)) return
+        // Sin playback: un comando que llegó en este intervalo no se pisa con la posición vieja.
+        connect.exchange(ackReport())
         val state = connect.state.value
         if (!state.signedIn || inJam) {
             mirroredKey = null
+            silenced = false
             return
         }
-        val session = state.session
-        val command = state.command
-        if (command?.type == "transfer" && session != null && command.revision > ackedTransfer) {
+        if (applyPending(state.command, state.session, state.deviceId)) return
+        val local = withContext(Dispatchers.Main) { localPlayback() }
+        connect.localPlayback = local
+        if (local != null && state.publishesLocalAudio(inJam)) {
+            silenced = false
+            connect.exchange(ackReport(playback = local))
+        }
+        val after = connect.state.value
+        val session = after.session
+        if (after.isFollowingRemote() && session != null) {
+            yieldLocal()
+            silenceLocal()
+            withContext(Dispatchers.Main) { mirrorQueue(session) }
+        } else {
+            silenced = false
+        }
+    }
+
+    private fun ackReport(playback: ConnectPlayback? = null) =
+        ConnectReport(
+            playback = playback,
+            ackTransfer = ackedTransfer.takeIf { it > 0L },
+            ackControl = ackedControl.takeIf { it > 0L },
+        )
+
+    /** Aplica transfer o control pendiente. Devuelve true si este paso ya publicó el resultado. */
+    private suspend fun applyPending(
+        command: ConnectCommand?,
+        session: ConnectSession?,
+        deviceId: String,
+    ): Boolean {
+        if (command == null || session == null) return false
+        if (command.type == "transfer" && command.revision > ackedTransfer) {
             applyTransfer(session)
             ackedTransfer = command.revision
             wasPlaying = session.isPlaying
-        } else if (command?.type == "control" && command.revision > ackedControl && session?.activeDeviceId == state.deviceId) {
+            silenced = false
+            val local = withContext(Dispatchers.Main) { localPlayback() }
+            connect.localPlayback = local
+            connect.exchange(ackReport(playback = local))
+            return true
+        }
+        if (command.type == "control" && command.revision > ackedControl && session.activeDeviceId == deviceId) {
             applyControl(command.action, command.index ?: session.index, command.positionMs ?: session.positionMs)
             ackedControl = command.revision
-        } else if (state.isFollowingRemote() && session != null) {
-            yieldLocal()
-            withContext(Dispatchers.Main) { mirrorQueue(session) }
+            wasPlaying = session.isPlaying
+            val local = withContext(Dispatchers.Main) { localPlayback() }
+            connect.localPlayback = local
+            connect.exchange(ackReport(playback = local))
+            return true
         }
+        return false
     }
 
     private suspend fun yieldLocal() {
@@ -125,6 +174,23 @@ internal class ConnectPlaybackBridge(
             try {
                 player.pause()
                 player.playWhenReady = false
+                wasPlaying = false
+            } finally {
+                applying = false
+            }
+        }
+    }
+
+    /** El seguidor no abre un segundo stream: vacía MPV o ExoPlayer una vez y deja la UI en la sesión. */
+    private suspend fun silenceLocal() {
+        if (silenced) return
+        withContext(Dispatchers.Main) {
+            applying = true
+            try {
+                val player = handler.player
+                if (player.mediaItemCount > 0) player.clearMediaItems()
+                player.playWhenReady = false
+                silenced = true
                 wasPlaying = false
             } finally {
                 applying = false
@@ -246,7 +312,6 @@ internal class ConnectPlaybackBridge(
 
     private companion object {
         const val TAG = "KillmonConnect"
-        const val HEARTBEAT_MS = 8_000L
         const val MAX_QUEUE = 40
         val VIDEO = Regex("^[A-Za-z0-9_-]{11}$")
 
@@ -258,7 +323,7 @@ internal class ConnectPlaybackBridge(
         fun mediaItem(track: ConnectTrack) =
             GenericMediaItem(
                 mediaId = track.videoId,
-                uri = "https://music.youtube.com/watch?v=${track.videoId}",
+                uri = track.videoId,
                 metadata =
                     GenericMediaMetadata(
                         title = track.title,
