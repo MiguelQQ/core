@@ -348,9 +348,9 @@ private fun provideResolvingDataSourceFactory(
             } else {
                 streamRepository.getNewFormat(mediaId).lastOrNull()?.let {
                     val audioUrl = it.audioUrl
-                    if (audioUrl != null && it.expiredTime > now()) {
+                    if (audioUrl != null && it.expiredTime > now() && streamRepository.useCachedAudio(mediaId, it.itag)) {
                         Logger.d("Stream", audioUrl)
-                        Logger.d("Stream", "Audio from format")
+                        Logger.d("Stream", "Audio from format itag ${it.itag} bitrate ${it.bitrate}")
                         val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
                         Logger.d("Stream", "is 403 $is403Url")
                         if (!is403Url) {

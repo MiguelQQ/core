@@ -1,5 +1,6 @@
 package com.maxrave.data.killmon
 
+import com.maxrave.common.QUALITY
 import com.maxrave.common.SELECTED_LANGUAGE
 import com.maxrave.domain.data.model.killmon.KillmonAuthResult
 import com.maxrave.domain.data.model.killmon.KillmonSession
@@ -135,7 +136,17 @@ internal class KillmonAccountRepositoryImpl(
             api.register(email.trim(), password, displayName.trim())
         }
 
+    internal var beforeClear: (suspend () -> Unit)? = null
+
+    internal suspend fun <T> withAccess(call: suspend (String) -> ApiOutcome<T>): ApiOutcome<T>? =
+        when (val result = authed(call)) {
+            is Authed.Ok -> ApiOutcome.Success(result.value)
+            is Authed.Err -> result.failure
+            Authed.SignedOut -> null
+        }
+
     override suspend fun logout() {
+        runCatching { beforeClear?.invoke() }
         val refresh = tokenStore.load()?.refreshToken
         if (!refresh.isNullOrBlank()) {
             runCatching { api.logout(refresh) }
@@ -148,6 +159,7 @@ internal class KillmonAccountRepositoryImpl(
 
     override suspend fun deleteAccount(password: String): KillmonAuthResult =
         try {
+            runCatching { beforeClear?.invoke() }
             when (val result = authed { api.deleteMe(it, password) }) {
                 is Authed.Ok -> {
                     prefsMutex.withLock { clearLocal() }
@@ -258,8 +270,10 @@ internal class KillmonAccountRepositoryImpl(
             }
         }
         prefs.bool("explicit_content")?.let { dataStore.setExplicitContentEnabled(it) }
-        prefs.string("quality")?.takeIf { it.isNotBlank() }?.let { dataStore.setQuality(it) }
-        prefs.string("download_quality")?.takeIf { it.isNotBlank() }?.let { dataStore.setDownloadQuality(it) }
+        prefs.string("quality")?.takeIf { it.isNotBlank() }?.let { dataStore.setQuality(QUALITY.normalize(it)) }
+        prefs.string("download_quality")?.takeIf { it.isNotBlank() }?.let {
+            dataStore.setDownloadQuality(QUALITY.normalize(it))
+        }
         prefs.string("now_playing_style")?.takeIf { it.isNotBlank() }?.let { dataStore.setNowPlayingStyle(it) }
         prefs.string("lyrics_style")?.takeIf { it.isNotBlank() }?.let { dataStore.setLyricsStyle(it) }
         prefs.string("theme_color_source")?.takeIf { it.isNotBlank() }?.let { dataStore.setThemeColorSource(it) }
@@ -382,8 +396,14 @@ internal class KillmonAccountRepositoryImpl(
             themeColorSource = dataStore.themeColorSource.first(),
             customThemeColor = dataStore.customThemeColor.first(),
             explicitContent = dataStore.explicitContentEnabled.first(),
-            quality = dataStore.quality.first(),
-            downloadQuality = dataStore.downloadQuality.first(),
+            quality =
+                QUALITY.normalize(dataStore.quality.first()).also { shown ->
+                    if (shown != dataStore.quality.first()) dataStore.setQuality(shown)
+                },
+            downloadQuality =
+                QUALITY.normalize(dataStore.downloadQuality.first()).also { shown ->
+                    if (shown != dataStore.downloadQuality.first()) dataStore.setDownloadQuality(shown)
+                },
             nowPlayingStyle = dataStore.nowPlayingStyle.first(),
             lyricsStyle = dataStore.lyricsStyle.first(),
             liquidGlass = dataStore.enableLiquidGlass.first(),

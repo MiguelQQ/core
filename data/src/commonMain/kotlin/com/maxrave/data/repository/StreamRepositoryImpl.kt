@@ -1,5 +1,6 @@
 package com.maxrave.data.repository
 
+import com.maxrave.common.AudioCandidate
 import com.maxrave.common.ITAG
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.common.QUALITY
@@ -33,6 +34,8 @@ internal class StreamRepositoryImpl(
     private val localDataSource: LocalDataSource,
     private val youTube: YouTube,
 ) : StreamRepository {
+    /** Video ids whose audio was already chosen with [ITAG.bestAudio] in this process. */
+    private val audioSettled = mutableSetOf<String>()
     override suspend fun insertNewFormat(newFormat: NewFormatEntity) =
         withContext(Dispatchers.IO) {
             localDataSource.insertNewFormat(newFormat)
@@ -91,12 +94,14 @@ internal class StreamRepositoryImpl(
         muxed: Boolean,
     ): Flow<String?> =
         flow {
-            val itag =
-                if (isDownloading) {
-                    QUALITY.itagOf(dataStoreManager.downloadQuality.first())
-                } else {
-                    QUALITY.itagOf(dataStoreManager.quality.first())
-                }
+            // Low/Medium stored from older builds pinned itag 251. Rewrite them so the next
+            // sync and the settings row show the high tier; playback below does not wait on that.
+            val storedQuality = if (isDownloading) dataStoreManager.downloadQuality.first() else dataStoreManager.quality.first()
+            val qualityLabel = QUALITY.normalize(storedQuality)
+            if (storedQuality != qualityLabel) {
+                if (isDownloading) dataStoreManager.setDownloadQuality(qualityLabel) else dataStoreManager.setQuality(qualityLabel)
+            }
+            val itag = QUALITY.itagOf(qualityLabel)
             val videoItag =
                 if (!muxed) {
                     VIDEO_QUALITY.itags.getOrNull(
@@ -167,17 +172,31 @@ internal class StreamRepositoryImpl(
                             ?: formatList.find { it.itag == ITAG.VIDEO_720P }
                             ?: formatList.find { it.itag == ITAG.VIDEO_360P }
                             ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
-                    val audioTwinItag = ITAG.highQualityTwinOf(itag)
+                    val playableAudio =
+                        formatList.filter { format ->
+                            val url = format.url
+                            format.isAudio && !url.isNullOrEmpty() && !youTube.isManifestUrl(url)
+                        }
                     val audioFormat =
-                        formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
-                            // 256 kbps arrives as Opus or as AAC. If the account has neither, the
-                            // highest audio that did arrive is what that choice can actually play.
-                            formatList.find { it.itag == audioTwinItag }
-                                ?: formatList
-                                    .filter { it.isAudio && !it.url.isNullOrEmpty() }
-                                    .maxByOrNull { it.bitrate }
+                        if (!isDownloading || ITAG.isHighAudio(itag)) {
+                            // Playback (and a high download setting) takes the best itag present,
+                            // not the one the old label named. Medium stays ~160 kbps only when
+                            // 774/141/327 are absent from this response.
+                            val best =
+                                ITAG.bestAudio(
+                                    playableAudio.map {
+                                        AudioCandidate(
+                                            itag = it.itag,
+                                            bitrate = it.bitrate,
+                                            averageBitrate = it.averageBitrate ?: 0,
+                                            audioQuality = it.audioQuality,
+                                        )
+                                    },
+                                )
+                            best?.let { chosen -> playableAudio.find { it.itag == chosen.itag } }
                         } else {
-                            formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
+                            formatList.find { it.itag == itag && it.isAudio && !it.url.isNullOrEmpty() }
+                                ?: playableAudio.maxByOrNull { it.bitrate }
                         }
                     var format =
                         if (isVideo) {
@@ -199,7 +218,9 @@ internal class StreamRepositoryImpl(
                     // listener's IP address.
                     Logger.i(
                         "Stream",
-                        "$videoId: ${data.third}, itag ${format?.itag} ${format?.mimeType?.substringBefore(';')}" +
+                        "$videoId: ${data.third}, itag ${format?.itag} " +
+                            "bitrate ${format?.bitrate} avg ${format?.averageBitrate} " +
+                            "${format?.mimeType?.substringBefore(';')}" +
                             (if (muxed) ", HLS" else "") +
                             ", expires in ${response.streamingData?.expiresInSeconds}s",
                     )
@@ -284,6 +305,9 @@ internal class StreamRepositoryImpl(
                             keyScale = tidalKeyScale,
                         ),
                     )
+                    if (!isVideo && !muxed && !isDownloading) {
+                        synchronized(audioSettled) { audioSettled.add(videoId) }
+                    }
                     if (data.first != null) {
                         emit(
                             if (muxed) {
@@ -404,6 +428,14 @@ internal class StreamRepositoryImpl(
         }.flowOn(Dispatchers.IO)
 
     override fun is403Url(url: String) = flow { emit(youTube.is403Url(url)) }.flowOn(Dispatchers.IO)
+
+    override fun useCachedAudio(
+        videoId: String,
+        itag: Int,
+    ): Boolean {
+        if (ITAG.isHighAudio(itag) || itag in VIDEO_QUALITY.itags || itag == ITAG.MUXED_360P) return true
+        return synchronized(audioSettled) { videoId in audioSettled }
+    }
 
     override suspend fun invalidateFormat(videoId: String) {
         withContext(Dispatchers.IO) {

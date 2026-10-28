@@ -1367,6 +1367,36 @@ class YouTube {
         }
     }
 
+    /** A PipePipe audio URL that the WEB_REMIX player response did not list. */
+    private fun audioOnlyFormat(
+        itag: Int,
+        url: String,
+    ) = PlayerResponse.StreamingData.Format(
+        itag = itag,
+        url = url,
+        mimeType =
+            if (itag == ITAG.AUDIO_OPUS_HIGH || itag == ITAG.AUDIO_OPUS_MEDIUM || itag == ITAG.AUDIO_OPUS_LOW || itag == 249) {
+                "audio/webm"
+            } else {
+                "audio/mp4"
+            },
+        bitrate = ITAG.nominalAudioBitrate(itag),
+        width = null,
+        height = null,
+        contentLength = contentLengthOf(url),
+        quality = if (ITAG.isHighAudio(itag)) "AUDIO_QUALITY_HIGH" else "",
+        fps = null,
+        qualityLabel = null,
+        averageBitrate = ITAG.nominalAudioBitrate(itag),
+        audioQuality = if (ITAG.isHighAudio(itag)) "AUDIO_QUALITY_HIGH" else null,
+        approxDurationMs = null,
+        audioSampleRate = 48000,
+        audioChannels = 2,
+        loudnessDb = null,
+        lastModified = null,
+        signatureCipher = null,
+    )
+
     suspend fun newPipePlayer(
         videoId: String,
         tempRes: PlayerResponse,
@@ -1403,7 +1433,16 @@ class YouTube {
                                     url = url,
                                     contentLength = url?.let(::contentLengthOf) ?: adaptiveFormats.contentLength,
                                 )
-                            },
+                            } +
+                                streamsList.mapNotNull { (streamItag, streamUrl) ->
+                                    if (streamUrl.isBlank() || isManifestUrl(streamUrl)) return@mapNotNull null
+                                    if (ITAG.nominalAudioBitrate(streamItag) <= 0) return@mapNotNull null
+                                    if (sigResponse.streamingData?.adaptiveFormats?.any { it.itag == streamItag } == true) {
+                                        return@mapNotNull null
+                                    }
+                                    // WEB_REMIX often omits 774/141. PipePipe can still have the URL.
+                                    audioOnlyFormat(streamItag, streamUrl)
+                                },
                         hlsManifestUrl = streamsList.firstOrNull { it.first == 96 }?.second,
                     ),
             )

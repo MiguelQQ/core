@@ -51,6 +51,15 @@ interface StreamRepository {
 
     fun is403Url(url: String): Flow<Boolean>
 
+    /**
+     * False when [itag] is a low or medium audio stream that this process has not re-resolved yet.
+     * A format row saved under the old Medium setting would keep playing ~160 kbps until it expired.
+     */
+    fun useCachedAudio(
+        videoId: String,
+        itag: Int,
+    ): Boolean
+
     suspend fun invalidateFormat(videoId: String)
 
     /**

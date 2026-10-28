@@ -3152,7 +3152,10 @@ class MpvPlayerAdapter(
             val audioUrl = format.audioUrl
             val videoUrl = format.videoUrl
 
-            if (shouldFindVideo && !videoUrl.isNullOrEmpty()) {
+            val audioCurrent = streamRepository.useCachedAudio(videoId, format.itag)
+            if (!audioCurrent) {
+                Logger.w("Stream", "Cached audio itag ${format.itag} is below the high tier; resolving again")
+            } else if (shouldFindVideo && !videoUrl.isNullOrEmpty()) {
                 val is403Video = streamRepository.is403Url(videoUrl).firstOrNull() != false
                 if (!is403Video) {
                     // Return video URL with audio as a second EDL stream for merging
@@ -3174,7 +3177,7 @@ class MpvPlayerAdapter(
             } else if (!shouldFindVideo && !audioUrl.isNullOrEmpty()) {
                 val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
                 if (!is403Url) {
-                    Logger.w("Stream", "Audio from format")
+                    Logger.w("Stream", "Audio from format itag ${format.itag} bitrate ${format.bitrate}")
                     return PlayableSource(isVideo = false, url = audioUrl)
                 }
             }

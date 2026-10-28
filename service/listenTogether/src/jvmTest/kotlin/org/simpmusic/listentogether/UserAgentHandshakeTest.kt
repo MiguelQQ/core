@@ -51,7 +51,7 @@ class UserAgentHandshakeTest {
                     val (request, h) = headers(http)
                     assertEquals("POST /api/jam/rooms HTTP/1.1", request)
                     assertEquals("Bearer account-secret", h["authorization"])
-                    assertEquals("Killmon Music/0.7.16", h["user-agent"])
+                    assertEquals("Killmon Music/0.7.17", h["user-agent"])
                     val body = """{"code":"ABC234"}"""
                     http.getOutputStream().write("HTTP/1.1 201 Created\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n$body".toByteArray())
                 }
@@ -59,7 +59,7 @@ class UserAgentHandshakeTest {
                     socket.soTimeout = 10_000
                     val (request, h) = headers(socket)
                     assertEquals("GET /api/jam/ws HTTP/1.1", request)
-                    assertEquals("Killmon Music/0.7.16", h["user-agent"])
+                    assertEquals("Killmon Music/0.7.17", h["user-agent"])
                     val accept = Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1").digest((h.getValue("sec-websocket-key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray()))
                     socket.getOutputStream().write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n".toByteArray())
                     val auth = readFrame(socket)

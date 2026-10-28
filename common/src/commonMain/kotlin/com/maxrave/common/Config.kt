@@ -281,6 +281,9 @@ object ITAG {
      */
     const val AUDIO_AAC_HIGH: Int = 141
 
+    /** AAC 256 kbps inside an MP4 container. Same tier as [AUDIO_AAC_HIGH]; some clients send this instead. */
+    const val AUDIO_AAC_HIGH_MP4: Int = 327
+
     /** H.264 360p, adaptive video — what the "360p" video-quality setting selects. */
     const val VIDEO_360P: Int = 134
 
@@ -294,7 +297,44 @@ object ITAG {
     const val MUXED_360P: Int = 18
 
     /** Every adaptive audio itag the app knows how to play. */
-    val AUDIO: Set<Int> = setOf(AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH)
+    val AUDIO: Set<Int> = setOf(AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH, AUDIO_AAC_HIGH_MP4)
+
+    /** Opus/AAC 256 kbps. Itag 251 (the ~160 kbps "medium" Opus) is not in this set. */
+    val HIGH_AUDIO: Set<Int> = setOf(AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH, AUDIO_AAC_HIGH_MP4)
+
+    fun isHighAudio(itag: Int?): Boolean = itag != null && itag in HIGH_AUDIO
+
+    /** Nominal bitrate when the player response omits one. 0 for an itag this table does not know. */
+    fun nominalAudioBitrate(itag: Int): Int =
+        when (itag) {
+            139 -> 48_000
+            140 -> 128_000
+            249 -> 50_000
+            AUDIO_OPUS_LOW -> 70_000
+            AUDIO_OPUS_MEDIUM -> 160_000
+            256 -> 192_000
+            AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH, AUDIO_AAC_HIGH_MP4 -> 256_000
+            else -> 0
+        }
+
+    /**
+     * The stream to play: a 256 kbps Opus/AAC itag when the response has one, otherwise the
+     * highest bitrate audio that did arrive. Itag 251 (~160 kbps, often shown as 148–158) loses
+     * to 774/141/327 even when its reported bitrate is filled in and the high one's is not.
+     */
+    fun bestAudio(candidates: List<AudioCandidate>): AudioCandidate? {
+        if (candidates.isEmpty()) return null
+        val high =
+            candidates.filter {
+                isHighAudio(it.itag) || it.audioQuality.equals("AUDIO_QUALITY_HIGH", ignoreCase = true)
+            }
+        val pool = if (high.isNotEmpty()) high else candidates
+        return pool.maxWithOrNull(
+            compareBy<AudioCandidate> { it.effectiveBitrate() }
+                .thenBy { if (it.itag == AUDIO_OPUS_HIGH) 1 else 0 }
+                .thenBy { if (it.itag == AUDIO_AAC_HIGH || it.itag == AUDIO_AAC_HIGH_MP4) 1 else 0 },
+        )
+    }
 
     /** Every adaptive video itag the app knows how to play. */
     val VIDEO: Set<Int> = setOf(VIDEO_1080P, VIDEO_720P, VIDEO_360P)
@@ -310,9 +350,22 @@ object ITAG {
     fun highQualityTwinOf(itag: Int?): Int? =
         when (itag) {
             AUDIO_OPUS_HIGH -> AUDIO_AAC_HIGH
-            AUDIO_AAC_HIGH -> AUDIO_OPUS_HIGH
+            AUDIO_AAC_HIGH, AUDIO_AAC_HIGH_MP4 -> AUDIO_OPUS_HIGH
             else -> null
         }
+}
+
+/** One audio itag from a player response, for [ITAG.bestAudio]. */
+data class AudioCandidate(
+    val itag: Int,
+    val bitrate: Int = 0,
+    val averageBitrate: Int = 0,
+    val audioQuality: String? = null,
+) {
+    fun effectiveBitrate(): Int {
+        val reported = maxOf(bitrate, averageBitrate).coerceAtLeast(0)
+        return maxOf(reported, ITAG.nominalAudioBitrate(itag))
+    }
 }
 
 object QUALITY {
@@ -358,16 +411,17 @@ object QUALITY {
         )
 
     /**
-     * The stored label as a currently-valid one: itself when still valid, its replacement when it
-     * is a known older label, and [items]`[0]` for anything unrecognised.
+     * The label playback and download actually use.
      *
-     * Migration is lazy on purpose — nothing rewrites the stored value, so a read never races a
-     * write. The stored text is replaced the next time the user picks an entry themselves.
+     * Low and Medium (and a blank or unknown value) become [defaultLabel], Opus 256 kbps.
+     * A device that already stored "Medium - 129kps" was pinning itag 251 (~160 kbps, drawn as
+     * ~148–158) and never looked at 774/141 sitting in the same response. High AAC stays High AAC.
      */
     fun normalize(saved: String?): String {
-        val label = saved ?: return items[0].toString()
-        if (items.any { it.toString() == label }) return label
-        return LEGACY_ITEMS[label] ?: items[0].toString()
+        val label = saved?.trim().orEmpty()
+        if (label.isEmpty()) return defaultLabel
+        if (label == items[2].toString() || label == items[3].toString()) return label
+        return LEGACY_ITEMS[label] ?: defaultLabel
     }
 
     /** The itag a stored label selects. Goes through [normalize], so older labels still resolve. */

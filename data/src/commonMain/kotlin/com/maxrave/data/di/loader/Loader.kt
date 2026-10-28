@@ -1,6 +1,7 @@
 package com.maxrave.data.di.loader
 
 import com.maxrave.common.AppIdentity
+import com.maxrave.data.di.connectModule
 import com.maxrave.data.di.databaseModule
 import com.maxrave.data.di.listenTogetherModule
 import com.maxrave.data.di.mediaHandlerModule
@@ -22,6 +23,8 @@ fun loadAllModules(appIdentity: AppIdentity) {
     // ListenTogetherViewModel injects and starts it; start() is idempotent.
     loadKoinModules(listenTogetherModule)
     loadMediaService()
+    // Después del reproductor: el puente lee la cola local y el alcance del servicio.
+    loadKoinModules(connectModule)
     loadLoginSyncModule()
 }
 
