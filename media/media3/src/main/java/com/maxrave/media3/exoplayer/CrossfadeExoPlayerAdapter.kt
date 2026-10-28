@@ -972,6 +972,42 @@ internal class CrossfadeExoPlayerAdapter(
         }
     }
 
+    override fun loadPlaylistAt(
+        items: List<GenericMediaItem>,
+        index: Int,
+        positionMs: Long,
+        play: Boolean,
+    ) {
+        coroutineScope.launch {
+            currentLoadJob?.cancel()
+            if (isCrossfading) {
+                crossfadeJob?.cancel()
+                crossfadeJob = null
+                currentPlayerFilter?.enabled = false
+                secondaryPlayerFilter?.enabled = false
+                secondaryPlayer?.release()
+                secondaryPlayer = null
+                secondaryPlayerFilter = null
+                setCrossfading(false)
+            }
+            cancelPrecaching()
+            playlist.clear()
+            clearAllPrecacheInternal()
+            clearShuffleOrder()
+            internalShuffleModeEnabled = false
+            playlist.addAll(items)
+            val target = if (playlist.isEmpty()) -1 else index.coerceIn(0, playlist.lastIndex)
+            localCurrentMediaItemIndex = target
+            internalPlayWhenReady = play
+            notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
+            if (target >= 0) {
+                loadAndPlayTrackInternal(target, positionMs.coerceAtLeast(0L), play)
+            } else {
+                cleanupCurrentPlayerInternal()
+            }
+        }
+    }
+
     override fun addMediaItem(mediaItem: GenericMediaItem) {
         playlist.add(mediaItem)
         pointAtFirstItemIfUnset()

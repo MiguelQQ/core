@@ -61,6 +61,32 @@ interface MediaPlayerInterface {
         if (startPositionMs > 0L) seekTo(startPositionMs)
     }
 
+    /**
+     * Reemplaza la cola y carga [index] en [positionMs] en un solo turno del hilo del player.
+     *
+     * clear + add + seek no es lo mismo: en mpv y en el ExoPlayer con crossfade, clear solo encola
+     * el vaciado. Los add que ocurren antes de ese vaciado se pierden, el seek cae en una lista
+     * vacía y el aparato se queda en otra pista, o en ninguna, sin reproducir.
+     *
+     * El default sirve para un player cuyo clear es síncrono. Los adaptadores con clear encolado
+     * lo sustituyen.
+     */
+    fun loadPlaylistAt(
+        items: List<GenericMediaItem>,
+        index: Int,
+        positionMs: Long,
+        play: Boolean,
+    ) {
+        clearMediaItems()
+        items.forEach { addMediaItem(it) }
+        if (items.isEmpty()) {
+            playWhenReady = false
+            return
+        }
+        seekTo(index.coerceIn(0, items.lastIndex), positionMs.coerceAtLeast(0L))
+        playWhenReady = play
+    }
+
     fun addMediaItem(mediaItem: GenericMediaItem)
 
     fun addMediaItem(

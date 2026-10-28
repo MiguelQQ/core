@@ -380,6 +380,7 @@ internal data class ConnectControlBody(
     val action: String,
     @SerialName("position_ms")
     val positionMs: Long? = null,
+    val volume: Float? = null,
 )
 
 @Serializable
@@ -396,6 +397,7 @@ internal data class ConnectPlaybackBody(
     val positionMs: Long,
     @SerialName("is_playing")
     val isPlaying: Boolean,
+    val volume: Float = 1f,
 )
 
 @Serializable
@@ -439,6 +441,7 @@ internal data class ConnectSessionWire(
     @SerialName("position_ms")
     val positionMs: Long = 0,
     val index: Int = 0,
+    val volume: Float = 1f,
     val queue: List<ConnectTrackBody> = emptyList(),
 )
 
@@ -450,6 +453,7 @@ internal data class ConnectCommandWire(
     @SerialName("position_ms")
     val positionMs: Long? = null,
     val index: Int? = null,
+    val volume: Float? = null,
 )
 
 private object FlexibleStringSerializer : KSerializer<String> {

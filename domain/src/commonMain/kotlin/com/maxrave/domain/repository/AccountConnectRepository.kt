@@ -16,9 +16,10 @@ interface AccountConnectRepository {
     /** Lleva la sesión (cola y posición) a [targetDeviceId]. El audio pasa a sonar allí. */
     fun transferTo(targetDeviceId: String)
 
-    /** Play, pause, seek, next o previous sobre el aparato que tiene el audio. */
+    /** Play, pause, seek, next, previous o volume sobre el aparato que tiene el audio. */
     fun remoteControl(
         action: String,
         positionMs: Long? = null,
+        volume: Float? = null,
     )
 }

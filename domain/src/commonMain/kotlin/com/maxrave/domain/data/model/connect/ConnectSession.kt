@@ -21,6 +21,8 @@ data class ConnectPlayback(
     val index: Int,
     val positionMs: Long,
     val isPlaying: Boolean,
+    /** 0..1 del aparato que suena. El seguidor lo usa como base de las teclas de volumen. */
+    val volume: Float = 1f,
 )
 
 data class ConnectSession(
@@ -31,6 +33,8 @@ data class ConnectSession(
     val positionAtMs: Long,
     val index: Int,
     val queue: List<ConnectTrack>,
+    /** Ganancia del aparato activo, 0..1. No es el volumen del sistema del seguidor. */
+    val volume: Float = 1f,
 ) {
     fun currentTrack(): ConnectTrack? = queue.getOrNull(index)
 
@@ -48,6 +52,7 @@ data class ConnectSession(
             index = index.coerceIn(0, (queue.size - 1).coerceAtLeast(0)),
             positionMs = positionMs.coerceAtLeast(0L),
             isPlaying = isPlaying,
+            volume = volume.coerceIn(0f, 1f),
         )
 
     /**
@@ -58,6 +63,7 @@ data class ConnectSession(
         action: String,
         requestedPositionMs: Long?,
         nowMs: Long,
+        volume: Float? = null,
     ): ConnectSession {
         val estimated = estimatedPositionMs(nowMs)
         var nextIndex = index
@@ -86,6 +92,15 @@ data class ConnectSession(
                 } else {
                     nextPosition = 0L
                 }
+            }
+            "volume" -> {
+                val level = volume ?: return this
+                if (level.isNaN() || level < 0f || level > 1f) return this
+                return copy(
+                    volume = level,
+                    positionMs = estimated,
+                    positionAtMs = nowMs,
+                )
             }
             else -> return this
         }
@@ -138,6 +153,7 @@ data class ConnectCommand(
     val action: String? = null,
     val positionMs: Long? = null,
     val index: Int? = null,
+    val volume: Float? = null,
 )
 
 data class ConnectState(

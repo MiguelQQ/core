@@ -6,6 +6,10 @@ import com.maxrave.domain.data.model.connect.ConnectPlayback
 import com.maxrave.domain.data.model.connect.ConnectSession
 import com.maxrave.domain.data.model.connect.ConnectState
 import com.maxrave.domain.data.model.connect.ConnectTrack
+import com.maxrave.domain.data.model.connect.PlaybackHold
+import com.maxrave.domain.data.model.connect.holdFor
+import com.maxrave.domain.data.model.connect.mergeConnectSession
+import com.maxrave.domain.data.model.connect.shouldSendTransport
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.repository.AccountConnectRepository
 import com.maxrave.logger.Logger
@@ -20,6 +24,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal data class ConnectReport(
@@ -44,6 +50,12 @@ internal class AccountConnectRepositoryImpl(
     private var deviceId: String = ""
     private var label = KillmonDeviceLabel("desktop", "Killmon Desktop")
     var localPlayback: ConnectPlayback? = null
+    private val stateMutex = Mutex()
+    private var nextSerial = 0
+    private var newestApplied = 0
+    private var hold: PlaybackHold? = null
+    private var lastTransportAction: String? = null
+    private var lastTransportAt = 0L
 
     suspend fun ensureReady(): Boolean {
         if (ready) return true
@@ -84,13 +96,14 @@ internal class AccountConnectRepositoryImpl(
                     ),
                 )
             }
+        val serial = stateMutex.withLock { ++nextSerial }
         when (outcome) {
             null -> _state.value = ConnectState(deviceId = deviceId)
             is ApiOutcome.Failure -> {
                 Logger.w(TAG, "presencia ${outcome.status} ${outcome.message}")
                 _state.value = _state.value.copy(deviceId = deviceId, signedIn = true, message = outcome.message)
             }
-            is ApiOutcome.Success -> _state.value = outcome.value.toState(deviceId)
+            is ApiOutcome.Success -> applyWire(outcome.value.toState(deviceId), serial)
         }
     }
 
@@ -114,7 +127,10 @@ internal class AccountConnectRepositoryImpl(
                 null -> _state.value = ConnectState(deviceId = deviceId)
                 is ApiOutcome.Failure ->
                     _state.value = _state.value.copy(signedIn = true, message = outcome.message ?: "No se pudo transferir.")
-                is ApiOutcome.Success -> _state.value = outcome.value.toState(deviceId)
+                is ApiOutcome.Success -> {
+                    val serial = stateMutex.withLock { ++nextSerial }
+                    applyWire(outcome.value.toState(deviceId), serial)
+                }
             }
             kick.trySend(Unit)
         }
@@ -123,26 +139,77 @@ internal class AccountConnectRepositoryImpl(
     override fun remoteControl(
         action: String,
         positionMs: Long?,
+        volume: Float?,
     ) {
         scope.launch {
             if (!ready || accounts.session.value == null) return@launch
             val now = Clock.System.now().toEpochMilliseconds()
-            _state.value.session?.let { current ->
-                val next = current.withControl(action, positionMs, now)
-                if (next != current) _state.value = _state.value.copy(session = next)
-            }
+            // Debounce, estado optimista y hold van juntos: un presence en vuelo no puede
+            // colarse entre el gesto y el hold y reponer el is_playing viejo.
+            val serial =
+                stateMutex.withLock {
+                    if (!shouldSendTransport(lastTransportAction, lastTransportAt, action, now)) return@withLock -1
+                    if (action == "play" || action == "pause") {
+                        lastTransportAction = action
+                        lastTransportAt = now
+                    }
+                    _state.value.session?.let { current ->
+                        val next = current.withControl(action, positionMs, now, volume)
+                        if (next != current) {
+                            hold = holdFor(action, next, current.revision, now) ?: hold
+                            _state.value = _state.value.copy(session = next)
+                        }
+                    }
+                    ++nextSerial
+                }
+            if (serial < 0) return@launch
             when (
                 val outcome =
                     accounts.withAccess { token ->
-                        api.control(token, ConnectControlBody(deviceId = deviceId, action = action, positionMs = positionMs))
+                        api.control(
+                            token,
+                            ConnectControlBody(
+                                deviceId = deviceId,
+                                action = action,
+                                positionMs = positionMs,
+                                volume = volume,
+                            ),
+                        )
                     }
             ) {
-                null -> _state.value = ConnectState(deviceId = deviceId)
+                null ->
+                    stateMutex.withLock {
+                        if (hold?.issuedAtMs == now) hold = null
+                        _state.value = ConnectState(deviceId = deviceId)
+                    }
                 is ApiOutcome.Failure ->
-                    _state.value = _state.value.copy(signedIn = true, message = outcome.message ?: "No se pudo controlar el otro dispositivo.")
-                is ApiOutcome.Success -> _state.value = outcome.value.toState(deviceId)
+                    stateMutex.withLock {
+                        if (hold?.issuedAtMs == now) hold = null
+                        _state.value =
+                            _state.value.copy(
+                                signedIn = true,
+                                message = outcome.message ?: "No se pudo controlar el otro dispositivo.",
+                            )
+                    }
+                is ApiOutcome.Success -> applyWire(outcome.value.toState(deviceId), serial)
             }
             kick.trySend(Unit)
+        }
+    }
+
+    private suspend fun applyWire(incoming: ConnectState, serial: Int) {
+        stateMutex.withLock {
+            val now = Clock.System.now().toEpochMilliseconds()
+            val merged = mergeConnectSession(_state.value.session, incoming.session, hold, now)
+            hold = merged.hold
+            val latest = serial >= newestApplied
+            if (latest) newestApplied = serial
+            _state.value =
+                if (latest) {
+                    incoming.copy(session = merged.session)
+                } else {
+                    _state.value.copy(session = merged.session)
+                }
         }
     }
 
@@ -198,6 +265,7 @@ private fun ConnectPlayback.toBody() =
         index = index,
         positionMs = positionMs,
         isPlaying = isPlaying,
+        volume = volume.coerceIn(0f, 1f),
     )
 
 @OptIn(ExperimentalTime::class)
@@ -212,6 +280,7 @@ private fun ConnectWire.toState(selfId: String): ConnectState {
                 positionMs = wire.positionMs.coerceAtLeast(0),
                 positionAtMs = now,
                 index = wire.index,
+                volume = wire.volume.coerceIn(0f, 1f),
                 queue =
                     wire.queue.map {
                         ConnectTrack(
@@ -246,6 +315,7 @@ private fun ConnectWire.toState(selfId: String): ConnectState {
                     action = it.action,
                     positionMs = it.positionMs,
                     index = it.index,
+                    volume = it.volume,
                 )
             },
     )

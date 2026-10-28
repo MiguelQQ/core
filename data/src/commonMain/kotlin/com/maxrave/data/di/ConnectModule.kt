@@ -15,11 +15,13 @@ val connectModule =
     module {
         single<AccountConnectRepository> {
             val accounts = get<KillmonAccountRepository>() as KillmonAccountRepositoryImpl
-            val repo = AccountConnectRepositoryImpl(accounts, KillmonApi(), get())
+            val dataStore = get<com.maxrave.domain.manager.DataStoreManager>()
+            val repo = AccountConnectRepositoryImpl(accounts, KillmonApi(), dataStore)
             ConnectPlaybackBridge(
                 connect = repo,
                 handler = get(),
                 jam = get(),
+                dataStore = dataStore,
                 scope = get<CoroutineScope>(named(Config.SERVICE_SCOPE)),
             ).start()
             repo
