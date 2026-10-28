@@ -637,6 +637,7 @@ internal class CrossfadeExoPlayerAdapter(
                 .setMediaSourceFactory(mediaSourceFactory)
                 .setRenderersFactory(perPlayerRenderers)
                 .build()
+        player.volume = com.maxrave.domain.data.model.connect.newHandleVolume(internalVolume)
 
         // The output the user picked, if any: a player built for the next track, a crossfade or a
         // precache starts where the others are playing rather than back on the system's choice.
@@ -678,8 +679,13 @@ internal class CrossfadeExoPlayerAdapter(
                 }
 
                 InternalState.PLAYING -> {
-                    internalPlayWhenReady = true
+                    val wake = com.maxrave.domain.data.model.connect.playWhileMarkedPlaying()
+                    internalPlayWhenReady = wake.playWhenReady
                     cachedIsLoading = false
+                    if (wake.callBackend) {
+                        requestAudioFocusInternal()
+                        currentPlayer?.play()
+                    }
                 }
 
                 else -> {
@@ -1881,6 +1887,7 @@ internal class CrossfadeExoPlayerAdapter(
                         return
                     }
                     if (isPlaying) {
+                        if (!internalPlayWhenReady) return
                         if (internalState != InternalState.PLAYING) {
                             transitionToState(InternalState.PLAYING)
                             notifyEqualizerIntent(true)
@@ -3201,6 +3208,7 @@ internal class CrossfadeExoPlayerAdapter(
 
                         try {
                             val pwf = createExoPlayerInstance()
+                            pwf.player.volume = com.maxrave.domain.data.model.connect.newHandleVolume(internalVolume)
                             pwf.player.setMediaItem(mediaItem.toMedia3MediaItem())
                             pwf.player.prepare()
                             precachedPlayers[mediaItem.mediaId] = PrecachedPlayer(pwf.player, mediaItem, pwf.filter)

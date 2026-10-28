@@ -9,6 +9,8 @@ import com.maxrave.domain.data.model.connect.ConnectPlayback
 import com.maxrave.domain.data.model.connect.ConnectSession
 import com.maxrave.domain.data.model.connect.ConnectTrack
 import com.maxrave.domain.data.model.connect.connectPollIntervalMs
+import com.maxrave.domain.data.model.connect.controlAckIncludesPlayback
+import com.maxrave.domain.data.model.connect.wasPlayingAfterControl
 import com.maxrave.domain.data.model.searchResult.songs.Artist
 import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
 import com.maxrave.domain.data.player.GenericMediaItem
@@ -147,20 +149,22 @@ internal class ConnectPlaybackBridge(
         if (command.type == "transfer" && command.revision > ackedTransfer) {
             applyTransfer(session)
             ackedTransfer = command.revision
-            wasPlaying = session.isPlaying
             silenced = false
             val local = withContext(Dispatchers.Main) { localPlayback() }
             connect.localPlayback = local
+            wasPlaying = withContext(Dispatchers.Main) { handler.player.playWhenReady }
             connect.exchange(ackReport(playback = local))
             return true
         }
         if (command.type == "control" && command.revision > ackedControl && session.activeDeviceId == deviceId) {
             applyControl(command.action, command.index ?: session.index, command.positionMs ?: session.positionMs)
             ackedControl = command.revision
-            wasPlaying = session.isPlaying
-            val local = withContext(Dispatchers.Main) { localPlayback() }
-            connect.localPlayback = local
-            connect.exchange(ackReport(playback = local))
+            val ready = withContext(Dispatchers.Main) { handler.player.playWhenReady }
+            wasPlaying = wasPlayingAfterControl(command.action, session.isPlaying, ready)
+            // The ack confirms the command. Playback goes on the next heartbeat, after the backend
+            // has the new play/pause. Sending both in one presence let the old is_playing win.
+            val playback = if (controlAckIncludesPlayback()) withContext(Dispatchers.Main) { localPlayback() } else null
+            connect.exchange(ackReport(playback = playback))
             return true
         }
         return false
@@ -232,12 +236,11 @@ internal class ConnectPlaybackBridge(
                 val player = handler.player
                 when (action) {
                     "play" -> {
-                        player.play()
-                        wasPlaying = true
+                        player.audioFocusLost = false
+                        player.playWhenReady = true
                     }
                     "pause" -> {
-                        player.pause()
-                        wasPlaying = false
+                        player.playWhenReady = false
                     }
                     "seek" -> player.seekTo(positionMs.coerceAtLeast(0L))
                     "next", "previous" -> {

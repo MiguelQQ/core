@@ -1,5 +1,6 @@
 package com.simpmusic.media_jvm.mpv
 
+import com.maxrave.domain.data.model.connect.mpvGainWrite
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.logger.Logger
 import com.sun.jna.Memory
@@ -181,6 +182,8 @@ class MpvPlayer private constructor(
             audioOnly: Boolean = true,
             networkCacheSeconds: Int = 10,
             liveStream: Boolean = false,
+            initialMasterPercent: Int = 100,
+            initialFadePercent: Int = 100,
         ): MpvPlayer? {
             val lib = MpvLibrary.INSTANCE ?: return null
             val ctx = lib.mpv_create()
@@ -241,6 +244,11 @@ class MpvPlayer private constructor(
             // surfaces as MPV_EVENT_END_FILE instead of MPV_EVENT_SHUTDOWN.
             option("idle", "yes")
             option("audio-client-name", "Killmon Music")
+            // Software gain stays at 0 until AUDIO_RECONFIG. A new AO otherwise emits the first
+            // buffers at the property default (100) before the user's master can be written.
+            val masterOption = initialMasterPercent.coerceIn(0, 100)
+            option("volume", "0")
+            optionalOption("ao-volume", masterOption.toString())
 
             // macOS only: keep mpv off ao_coreaudio, which leaks a process-wide CoreAudio
             // listener pointing at a freed `struct ao` and takes the whole JVM down the next
@@ -377,6 +385,7 @@ class MpvPlayer private constructor(
             }
 
             return MpvPlayer(ctx, lib, frameSource).also {
+                it.primeLevels(masterOption, initialFadePercent.coerceIn(0, 100), 100)
                 it.start()
             }
         }
@@ -513,9 +522,8 @@ class MpvPlayer private constructor(
 
             MpvEventId.AUDIO_RECONFIG -> {
                 // The audio output was just (re)created, and `ao-volume` only becomes settable once
-                // it exists. An earlier setMasterVolume/setFadeVolume therefore may have fallen back
-                // to the software volume — which would then multiply against the mixer level the
-                // previous track left behind. Re-apply now that the real target is reachable.
+                // it exists. Apply master and fade together in this same call. A separate write
+                // would leave one frame at the mixer default (100).
                 applyVolume()
             }
 
@@ -603,6 +611,7 @@ class MpvPlayer private constructor(
     ) {
         if (isReleased) return
         setPropertyString("pause", if (startPaused) "yes" else "no")
+        if (!aoVolumeWritable) setPropertyDouble("volume", 0.0)
         command("loadfile", url, "replace")
     }
 
@@ -641,6 +650,20 @@ class MpvPlayer private constructor(
 
     @Volatile
     private var sleepPercent = 100
+
+    /** False until `ao-volume` has been accepted. Until then the software gain stays at 0. */
+    @Volatile
+    private var aoVolumeWritable = false
+
+    internal fun primeLevels(
+        master: Int,
+        fade: Int,
+        sleep: Int,
+    ) {
+        masterPercent = master.coerceIn(0, 100)
+        fadePercent = fade.coerceIn(0, 100)
+        sleepPercent = sleep.coerceIn(0, 100)
+    }
 
     /**
      * The pipeline volume — what the volume slider controls. Must NOT be touched while a crossfade
@@ -716,11 +739,16 @@ class MpvPlayer private constructor(
      */
     private fun applyVolume() =
         synchronized(volumeLock) {
-            val master = masterPercent * sleepPercent / 100.0
-            if (setPropertyDouble("ao-volume", master, logFailure = false) >= 0) {
-                setPropertyDouble("volume", fadePercent.toDouble())
+            val write = mpvGainWrite(masterPercent, fadePercent, sleepPercent, outputReady = aoVolumeWritable)
+            if (!aoVolumeWritable && setPropertyDouble("ao-volume", write.aoVolume, logFailure = false) >= 0) {
+                aoVolumeWritable = true
+            }
+            val applied = mpvGainWrite(masterPercent, fadePercent, sleepPercent, outputReady = aoVolumeWritable)
+            if (aoVolumeWritable) {
+                setPropertyDouble("ao-volume", applied.aoVolume, logFailure = false)
+                setPropertyDouble("volume", applied.softwareVolume)
             } else {
-                setPropertyDouble("volume", master * fadePercent / 100.0)
+                setPropertyDouble("volume", applied.softwareVolume)
             }
         }
 

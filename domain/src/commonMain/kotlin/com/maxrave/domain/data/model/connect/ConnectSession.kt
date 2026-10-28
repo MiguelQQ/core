@@ -1,5 +1,9 @@
 package com.maxrave.domain.data.model.connect
 
+import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.searchResult.songs.Artist
+import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
+
 /**
  * Sesión de reproducción de una cuenta Killmon en varios aparatos.
  * El audio suena solo en [activeDeviceId]. El resto sigue la misma cola y posición.
@@ -94,6 +98,27 @@ data class ConnectSession(
             isPlaying = playing,
         )
     }
+}
+
+/** La misma pista, en el modelo que ya consumen la cola y Now Playing. */
+fun ConnectTrack.asTrack(): Track {
+    val url = thumbnail.ifBlank { "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" }
+    return Track(
+        album = null,
+        artists = artist.split(", ").filter { it.isNotBlank() }.map { Artist(id = null, name = it) },
+        duration = null,
+        durationSeconds = (durationMs / 1000L).toInt().takeIf { it > 0 },
+        isAvailable = true,
+        isExplicit = false,
+        likeStatus = null,
+        thumbnails = listOf(Thumbnail(544, url, 544)),
+        title = title.ifBlank { videoId },
+        videoId = videoId,
+        videoType = null,
+        category = null,
+        feedbackTokens = null,
+        resultType = null,
+    )
 }
 
 /** Con sesión o con otro aparato en línea el latido es corto: pausa y seek no pueden esperar 8 s. */

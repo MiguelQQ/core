@@ -342,6 +342,9 @@ internal class MediaServiceHandlerImpl(
         getFormatJob = Job()
         jobWatchtime = Job()
         skipSilent = runBlocking { dataStoreManager.skipSilent.first() == TRUE }
+        val savedVolume = runBlocking { dataStoreManager.playerVolume.first() }
+        player.volume = savedVolume
+        _controlState.value = _controlState.value.copy(volume = savedVolume)
         // Collected rather than read once like the settings around it: the equalizer is adjusted
         // while music is playing, and a curve that only takes effect after a restart is useless
         // for judging what you just changed.
@@ -1045,7 +1048,10 @@ internal class MediaServiceHandlerImpl(
         }
 
         when (playerEvent) {
-            is PlayerEvent.UpdateVolume -> {}
+            is PlayerEvent.UpdateVolume -> {
+                player.volume = playerEvent.newVolume
+                _controlState.value = _controlState.value.copy(volume = playerEvent.newVolume)
+            }
 
             PlayerEvent.Backward -> {
                 player.seekBack()
@@ -2450,7 +2456,10 @@ internal class MediaServiceHandlerImpl(
             loudnessEnhancer?.release()
             loudnessEnhancer = null
             volumeNormalizationJob?.cancel()
-            player.volume = 1f
+            // Normalization off must not write 1f: that setter also replaces the user's gain.
+            if (com.maxrave.domain.data.model.connect.volumeWriteWhenNormalizeOff() != null) {
+                player.volume = 1f
+            }
             return
         }
 

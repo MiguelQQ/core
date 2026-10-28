@@ -1,6 +1,9 @@
 package com.simpmusic.media_jvm.mpv
 
 import com.maxrave.common.MERGING_DATA_TYPE
+import com.maxrave.domain.data.model.connect.HandleStep
+import com.maxrave.domain.data.model.connect.audibleHandleOrder
+import com.maxrave.domain.data.model.connect.incomingHandleOrder
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.AudioOutputKind
@@ -333,8 +336,12 @@ class MpvPlayerAdapter(
                 }
 
                 InternalState.PLAYING -> {
-                    internalPlayWhenReady = true
+                    // The enum can say PLAYING while mpv is still paused (a seek restarts playback
+                    // and playing() used to trust the event). The backend call is what resumes.
+                    val wake = com.maxrave.domain.data.model.connect.playWhileMarkedPlaying()
+                    internalPlayWhenReady = wake.playWhenReady
                     cachedIsLoading = false
+                    if (wake.callBackend) currentPlayer?.play()
                 }
 
                 else -> {
@@ -1173,6 +1180,32 @@ class MpvPlayerAdapter(
         preferredAudioDevice?.let { setAudioDevice(it) }
     }
 
+    /** Levels and mute before loadFile. The shared `ao-volume` must not come up at 100. */
+    private fun MpvPlayer.runIncoming(load: () -> Unit) {
+        runHandleSteps(incomingHandleOrder(), load)
+    }
+
+    /** The track that is about to be heard: user level, then loadFile. */
+    private fun MpvPlayer.runAudible(load: () -> Unit) {
+        runHandleSteps(audibleHandleOrder(), load)
+    }
+
+    private fun MpvPlayer.runHandleSteps(
+        order: List<HandleStep>,
+        load: () -> Unit,
+    ) {
+        order.forEach { step ->
+            when (step) {
+                HandleStep.APPLY_LEVELS -> applyPlaybackLevels()
+                HandleStep.MUTE -> setMute(true)
+                HandleStep.FADE_ZERO -> setFadeVolume(0)
+                HandleStep.FADE_FULL -> setFadeVolume(100)
+                HandleStep.UNMUTE -> setMute(false)
+                HandleStep.LOAD_FILE -> load()
+            }
+        }
+    }
+
     /**
      * Put the user's pitch shift on this handle, if pitch is available at all right now.
      *
@@ -1531,11 +1564,10 @@ class MpvPlayerAdapter(
                     currentPlayerIsVideo = player.videoFrames != null
                     _currentVideoFrames.value = player.videoFrames
                     setupPlayerEventsInternal(player)
-                    player.applyPlaybackLevels()
 
                     if (cachedPrecache != null) {
-                        // The precached handle already has the file loaded and held paused;
-                        // unpausing is all that is needed (VLC needed an explicit play() here too).
+                        // Already loaded, held silent. Open the user's level before it becomes audible.
+                        player.runAudible { }
                         if (shouldPlay) {
                             player.play()
                         }
@@ -1543,7 +1575,9 @@ class MpvPlayerAdapter(
                     } else {
                         val source = resolvedSource
                         if (source != null) {
-                            player.loadFile(buildPlaybackUrl(source), startPaused = !shouldPlay)
+                            player.runAudible {
+                                player.loadFile(buildPlaybackUrl(source), startPaused = !shouldPlay)
+                            }
                         } else {
                             Logger.e(TAG, "resolvedSource is null — should not happen")
                             transitionToState(InternalState.ERROR)
@@ -1613,10 +1647,22 @@ class MpvPlayerAdapter(
         val cacheSeconds = if (source.isVideo) 15 else 10
         return if (source.isVideo) {
             Logger.d(TAG, "Creating video player with software render surface")
-            MpvPlayer.create(audioOnly = false, networkCacheSeconds = cacheSeconds, liveStream = source.isLive)
+            MpvPlayer.create(
+                audioOnly = false,
+                networkCacheSeconds = cacheSeconds,
+                liveStream = source.isLive,
+                initialMasterPercent = (internalVolume * 100).toInt(),
+                initialFadePercent = 0,
+            )
         } else {
             Logger.d(TAG, "Creating audio-only player")
-            MpvPlayer.create(audioOnly = true, networkCacheSeconds = cacheSeconds, liveStream = source.isLive)
+            MpvPlayer.create(
+                audioOnly = true,
+                networkCacheSeconds = cacheSeconds,
+                liveStream = source.isLive,
+                initialMasterPercent = (internalVolume * 100).toInt(),
+                initialFadePercent = 0,
+            )
         }
     }
 
@@ -1708,6 +1754,8 @@ class MpvPlayerAdapter(
                 override fun playing(player: MpvPlayer) {
                     coroutineScope.launch {
                         if (currentPlayer !== player) return@launch
+                        // A late PLAYBACK_RESTART must not claim PLAYING after the user paused.
+                        if (!internalPlayWhenReady) return@launch
                         if (internalState != InternalState.PLAYING) {
                             transitionToState(InternalState.PLAYING)
                             // Reset retry counter on successful playback
@@ -1982,7 +2030,9 @@ class MpvPlayerAdapter(
                                 null
                             } else {
                                 createMediaPlayerInternal(nextSource)?.also { newPlayer ->
-                                    newPlayer.loadFile(buildPlaybackUrl(nextSource), startPaused = true)
+                                    newPlayer.runIncoming {
+                                        newPlayer.loadFile(buildPlaybackUrl(nextSource), startPaused = true)
+                                    }
                                 }
                             }
                         }
@@ -2006,9 +2056,9 @@ class MpvPlayerAdapter(
                                 }
                             },
                         )
-                        nextPlayer.setMute(true)
-                        nextPlayer.applyPlaybackLevels()
-                        nextPlayer.setFadeVolume(0)
+                        if (cachedPrecache != null) {
+                            nextPlayer.runIncoming { }
+                        }
                         nextPlayer.play()
                         delay(50)
                         nextPlayer.setMute(false)
@@ -2895,8 +2945,9 @@ class MpvPlayerAdapter(
                                 if (player == null) {
                                     Logger.w(TAG, "Precaching skipped for $idx: could not create mpv player")
                                 } else {
-                                    player.applyPlaybackLevels()
-                                    player.loadFile(buildPlaybackUrl(source), startPaused = true)
+                                    player.runIncoming {
+                                        player.loadFile(buildPlaybackUrl(source), startPaused = true)
+                                    }
                                     precachedPlayers[mediaItem.mediaId] =
                                         PrecachedPlayer(player, mediaItem, source)
                                     Logger.d(TAG, "Precached player for index $idx")
