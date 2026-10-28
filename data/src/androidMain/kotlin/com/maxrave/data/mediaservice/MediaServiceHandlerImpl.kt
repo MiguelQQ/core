@@ -63,6 +63,7 @@ import com.maxrave.domain.mediaservice.handler.PlayerEvent
 import com.maxrave.domain.mediaservice.handler.PlaylistType
 import com.maxrave.domain.mediaservice.handler.QueueData
 import com.maxrave.domain.mediaservice.handler.RadioQueueTrim
+import com.maxrave.domain.mediaservice.handler.TasteAutoplay
 import com.maxrave.domain.mediaservice.handler.RepeatState
 import com.maxrave.domain.mediaservice.handler.SimpleMediaState
 import com.maxrave.domain.mediaservice.handler.SleepTimerState
@@ -74,6 +75,7 @@ import com.maxrave.domain.repository.LocalPlaylistRepository
 import com.maxrave.domain.repository.SongRepository
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.domain.utils.FilterState
+import com.maxrave.domain.utils.isEndlessQueueId
 import com.maxrave.domain.utils.MusicVideoType
 import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.connectArtists
@@ -122,6 +124,12 @@ import kotlin.math.pow
 
 private val TAG = "Media3ServiceHandlerImpl"
 
+private const val RADIO_PAGE_HOPS = 3
+private const val TASTE_RETRY_LIMIT = 3
+private const val TASTE_EMPTY_HOLD_MS = 120_000L
+private const val TASTE_FAIL_HOLD_MS = 20_000L
+private const val TASTE_RETRY_DELAY_MS = 25_000L
+
 internal class MediaServiceHandlerImpl(
     private val dataStoreManager: DataStoreManager,
     private val songRepository: SongRepository,
@@ -132,6 +140,22 @@ internal class MediaServiceHandlerImpl(
 ) : MediaPlayerHandler,
     MediaPlayerListener {
     private val backgroundScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val tasteRadio = TasteRadioLoader(songRepository, analyticsRepository)
+    private val tasteInFlight = AtomicBoolean(false)
+
+    /** Mirrors endless queue. Unset in the store means on, so this starts on too. */
+    @Volatile
+    private var endlessQueueEnabled: Boolean = true
+
+    /** Same seed produced nothing, or the radio call failed. Stops a stuck track from refetching. */
+    @Volatile
+    private var tasteBlockedSeed: String? = null
+
+    @Volatile
+    private var tasteBlockedUntilMs: Long = 0L
+
+    private var tasteFailures: Int = 0
+
     private val context: Context = getKoin().get()
     override val player: MediaPlayerInterface = getKoin().get()
 
@@ -334,6 +358,21 @@ internal class MediaServiceHandlerImpl(
     //
     init {
         player.addListener(this)
+        endlessQueueEnabled = runBlocking { dataStoreManager.endlessQueue.first() == TRUE }
+        coroutineScope.launch {
+            dataStoreManager.endlessQueue.collect { value ->
+                val enabled = value == TRUE
+                val turnedOn = enabled && !endlessQueueEnabled
+                endlessQueueEnabled = enabled
+                val list = _queueData.value.data.listTracks
+                if (turnedOn &&
+                    TasteAutoplay.shouldTopUp(list.size, player.currentMediaItemIndex) &&
+                    _queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZED
+                ) {
+                    loadMore()
+                }
+            }
+        }
         progressJob = Job()
         bufferedJob = Job()
         sleepTimerJob = Job()
@@ -1455,14 +1494,225 @@ internal class MediaServiceHandlerImpl(
         }
     }
 
+    private fun queueVideoIds(): Set<String> = _queueData.value.data.listTracks.map { it.videoId }.toSet()
+
+    private suspend fun recentPlayedIds(): Set<String> =
+        try {
+            analyticsRepository.getPlaybackEventsByOffset(0, 80).first().map { it.videoId }.toSet()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Taste autoplay recent plays unavailable: ${e.message}")
+            emptySet()
+        }
+
+    /** The playing track, or the last one when the player has already stepped off the end. */
+    private fun currentAutoplaySeed(): String? {
+        val tracks = _queueData.value.data.listTracks
+        if (tracks.isEmpty()) return null
+        val index = player.currentMediaItemIndex
+        return tracks.getOrNull(index)?.videoId
+            ?: player.currentMediaItem?.mediaId?.takeIf { it.isNotBlank() }
+            ?: tracks.lastOrNull()?.videoId
+    }
+
+    private fun tasteBlocked(seed: String): Boolean {
+        if (tasteBlockedSeed != seed) return false
+        if (System.currentTimeMillis() >= tasteBlockedUntilMs) {
+            tasteBlockedSeed = null
+            return false
+        }
+        return true
+    }
+
+    private fun blockTaste(
+        seed: String,
+        holdMs: Long,
+    ) {
+        tasteBlockedSeed = seed
+        tasteBlockedUntilMs = System.currentTimeMillis() + holdMs
+    }
+
+    /**
+     * Appends a taste radio after the queue the listener picked. One fetch at a time, on the
+     * service scope, so the player is only touched on its own thread. Errors are logged and
+     * swallowed. Does not call [setQueueData]: that would fold the new tracks into the album
+     * snapshot and turn crossfade off for the whole queue.
+     */
+    private fun appendTasteRadio(seedVideoId: String?) {
+        if (!endlessQueueEnabled) return
+        if (seedVideoId.isNullOrBlank()) {
+            _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+            return
+        }
+        if (tasteBlockedSeed != null && tasteBlockedSeed != seedVideoId) tasteFailures = 0
+        if (tasteBlocked(seedVideoId)) {
+            Logger.d(TAG, "Taste autoplay: waiting before retrying $seedVideoId")
+            _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+            return
+        }
+        if (!tasteInFlight.compareAndSet(false, true)) {
+            Logger.d(TAG, "Taste autoplay: fetch already running")
+            return
+        }
+        _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZING) }
+        coroutineScope.launch {
+            try {
+                when (val outcome = tasteRadio.load(seedVideoId, queueVideoIds())) {
+                    TasteRadioOutcome.Busy -> {
+                        Logger.d(TAG, "Taste autoplay: fetch already running")
+                        _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+                    }
+
+                    TasteRadioOutcome.Empty -> {
+                        Logger.w(TAG, "Taste autoplay: no new tracks for $seedVideoId")
+                        blockTaste(seedVideoId, TASTE_EMPTY_HOLD_MS)
+                        _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+                    }
+
+                    TasteRadioOutcome.Failed -> {
+                        Logger.w(TAG, "Taste autoplay failed for $seedVideoId")
+                        tasteFailures++
+                        blockTaste(seedVideoId, TASTE_FAIL_HOLD_MS)
+                        _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+                        if (tasteFailures <= TASTE_RETRY_LIMIT) {
+                            coroutineScope.launch {
+                                delay(TASTE_RETRY_DELAY_MS)
+                                if (!endlessQueueEnabled || tasteInFlight.get()) return@launch
+                                if (player.hasNextMediaItem()) return@launch
+                                if (currentAutoplaySeed() != seedVideoId) return@launch
+                                loadMore()
+                            }
+                        }
+                    }
+
+                    is TasteRadioOutcome.Ready -> {
+                        val batch = outcome.batch
+                        tasteFailures = 0
+                        tasteBlockedSeed = null
+                        _queueData.update {
+                            val data =
+                                if (batch.radioPlaylistId != null) {
+                                    it.data.copy(
+                                        playlistId = batch.radioPlaylistId,
+                                        // From here the queue is a radio. The album crossfade snapshot
+                                        // stays what setQueueData recorded at load.
+                                        playlistType = PlaylistType.RADIO,
+                                        continuation = batch.continuation,
+                                    )
+                                } else {
+                                    it.data.copy(continuation = batch.continuation)
+                                }
+                            it.copy(
+                                queueState = QueueData.StateSource.STATE_INITIALIZED,
+                                data = data,
+                            )
+                        }
+                        Logger.d(TAG, "Taste autoplay: appending ${batch.tracks.size} from $seedVideoId")
+                        loadMoreCatalog(ArrayList(batch.tracks))
+                    }
+                }
+            } catch (e: CancellationException) {
+                _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+                throw e
+            } catch (e: Exception) {
+                Logger.w(TAG, "Taste autoplay failed: ${e.message}")
+                tasteFailures++
+                blockTaste(seedVideoId, TASTE_FAIL_HOLD_MS)
+                _queueData.update { it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED) }
+            } finally {
+                tasteInFlight.set(false)
+            }
+        }
+    }
+
+    /**
+     * Next page of a YouTube playlist or radio. A radio page is deduped and capped; a playlist the
+     * listener opened is appended whole. When a radio page is exhausted or only repeats songs
+     * already queued, endless queue (when on) switches to a taste batch.
+     */
+    private suspend fun extendRemoteQueue(
+        playlistId: String,
+        startToken: String,
+    ) {
+        var token: String? = startToken
+        var hops = 0
+        val radio = playlistId.isEndlessQueueId()
+        while (token != null && hops < RADIO_PAGE_HOPS) {
+            hops++
+            Logger.w(TAG, "Check loadMore continuation $token")
+            val response = songRepository.getContinueTrack(playlistId, token).lastOrNull()
+            val list = response?.first
+            val next = response?.second
+            if (list == null) {
+                _queueData.update {
+                    it.copy(
+                        queueState = QueueData.StateSource.STATE_INITIALIZED,
+                        data = it.data.copy(continuation = null),
+                    )
+                }
+                if (endlessQueueEnabled) {
+                    Logger.w(TAG, "loadMore: Endless Queue")
+                    appendTasteRadio(currentAutoplaySeed())
+                } else {
+                    reorderShuffledQueue(player.getCurrentMediaTimeLine())
+                }
+                return
+            }
+            val page: ArrayList<Track> =
+                if (radio) {
+                    ArrayList(TasteAutoplay.pickTracks(list, emptyList(), queueVideoIds() + recentPlayedIds()))
+                } else {
+                    list
+                }
+            if (page.isNotEmpty()) {
+                Logger.d(TAG, "Check loadMore response: ${page.size} tracks")
+                loadMoreCatalog(page)
+                _queueData.update { it.copy(data = it.data.copy(continuation = next)) }
+                return
+            }
+            if (!radio) {
+                _queueData.update {
+                    it.copy(
+                        queueState = QueueData.StateSource.STATE_INITIALIZED,
+                        data = it.data.copy(continuation = next),
+                    )
+                }
+                reorderShuffledQueue(player.getCurrentMediaTimeLine())
+                return
+            }
+            if (next == null || next == token) break
+            token = next
+            _queueData.update { it.copy(data = it.data.copy(continuation = next)) }
+        }
+        _queueData.update {
+            it.copy(
+                queueState = QueueData.StateSource.STATE_INITIALIZED,
+                data = it.data.copy(continuation = null),
+            )
+        }
+        if (endlessQueueEnabled) {
+            Logger.w(TAG, "loadMore: radio page had nothing new")
+            appendTasteRadio(currentAutoplaySeed())
+        } else {
+            reorderShuffledQueue(player.getCurrentMediaTimeLine())
+        }
+    }
+
     override fun loadMore() {
         if (JamPlaybackRouter.actions != null || ConnectPlayRouter.blocksLocal()) return
-        if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
+        if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING || tasteInFlight.get()) return
         // Separate local and remote data
         // Local Add Prefix to PlaylistID to differentiate between local and remote
         // Local: LC-PlaylistID
-        val playlistId = _queueData.value.data.playlistId ?: return
-        Logger.w("Check loadMore", playlistId.toString())
+        val playlistId = _queueData.value.data.playlistId
+        if (playlistId == null) {
+            // Favorites, Downloaded, Most played and the other library lists are queued with no id.
+            Logger.w("Check loadMore", "no playlist id")
+            if (endlessQueueEnabled) appendTasteRadio(currentAutoplaySeed())
+            return
+        }
+        Logger.w("Check loadMore", playlistId)
         val continuation = _queueData.value.data.continuation
         Logger.w("Check loadMore", continuation.toString())
         if (continuation != null) {
@@ -1643,96 +1893,42 @@ internal class MediaServiceHandlerImpl(
                     }
                 }
             } else {
+                val pageToken = continuation
                 coroutineScope.launch {
                     _queueData.update {
                         it.copy(
                             queueState = QueueData.StateSource.STATE_INITIALIZING,
                         )
                     }
-                    Logger.w(TAG, "Check loadMore continuation $continuation")
-                    songRepository
-                        .getContinueTrack(playlistId, continuation)
-                        .lastOrNull()
-                        .let { response ->
-                            val list = response?.first
-                            if (list != null) {
-                                Logger.d(TAG, "Check loadMore response: ${list.size} tracks")
-                                loadMoreCatalog(list)
-                                _queueData.update {
-                                    it.copy(
-                                        data =
-                                            it.data.copy(
-                                                continuation = response.second,
-                                            ),
-                                    )
-                                }
-                            } else {
-                                _queueData.update {
-                                    it.copy(
-                                        data =
-                                            it.data.copy(
-                                                continuation = null,
-                                            ),
-                                    )
-                                }
-                                if (runBlocking { dataStoreManager.endlessQueue.first() } == TRUE) {
-                                    Logger.w(TAG, "loadMore: Endless Queue")
-                                    val lastTrack =
-                                        queueData.value.data.listTracks
-                                            .lastOrNull() ?: return@launch
-                                    val radioId = "RDAMVM${lastTrack.videoId}"
-                                    if (radioId == queueData.value.data.playlistId) {
-                                        Logger.w(TAG, "loadMore: Already in radio mode")
-                                        return@launch
-                                    }
-                                    _queueData.update {
-                                        it.copy(
-                                            data =
-                                                it.data.copy(
-                                                    playlistId = radioId,
-                                                    // Past the list the user picked: a radio from
-                                                    // here on, like the other Endless branch below.
-                                                    playlistType = PlaylistType.RADIO,
-                                                ),
-                                            queueState = QueueData.StateSource.STATE_INITIALIZED,
-                                        )
-                                    }
-                                    reorderShuffledQueue(player.getCurrentMediaTimeLine())
-                                    Logger.d("Check loadMore", "queueData: ${queueData.value}")
-                                    getRelated(lastTrack.videoId)
-                                }
-                            }
+                    try {
+                        extendRemoteQueue(playlistId, pageToken)
+                    } catch (e: CancellationException) {
+                        _queueData.update {
+                            it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
                         }
+                        throw e
+                    } catch (e: Exception) {
+                        Logger.w(TAG, "loadMore failed: ${e.message}")
+                        _queueData.update {
+                            it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
+                        }
+                    }
                 }
             }
-        } else if (runBlocking { dataStoreManager.endlessQueue.first() } == TRUE) {
+        } else if (endlessQueueEnabled) {
             Logger.w(TAG, "loadMore: Endless Queue")
-            val lastTrack =
-                queueData.value.data.listTracks
-                    .lastOrNull() ?: return
-            _queueData.update {
-                it.copy(
-                    queueState = QueueData.StateSource.STATE_INITIALIZED,
-                    data =
-                        it.data.copy(
-                            playlistId = "RDAMVM${lastTrack.videoId}",
-                            // Past the end of what the user picked, this queue IS a radio: from here
-                            // on it is extended by the radio of its last track and grows without end.
-                            // Saying so keeps the type honest and lets the history trim apply, while
-                            // the album snapshot for the crossfade rule was already taken at load.
-                            playlistType = PlaylistType.RADIO,
-                        ),
-                )
-            }
-            reorderShuffledQueue(player.getCurrentMediaTimeLine())
-            Logger.d("Check loadMore", "queueData: ${queueData.value}")
-            getRelated(lastTrack.videoId)
+            appendTasteRadio(currentAutoplaySeed())
         }
     }
 
     override fun getRelated(videoId: String) {
         if (JamPlaybackRouter.actions != null || ConnectPlayRouter.blocksLocal()) return
-        if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
+        if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING || tasteInFlight.get()) return
+        // Endless queue (on unless the listener turned it off) extends from taste, not the raw page.
+        if (endlessQueueEnabled) {
+            appendTasteRadio(videoId)
+            return
+        }
         coroutineScope.launch {
             songRepository.getRelatedData(videoId).collect { response ->
                 when (response) {
@@ -1873,6 +2069,9 @@ internal class MediaServiceHandlerImpl(
         isAddToQueue: Boolean,
     ) {
         if (ConnectPlayRouter.blocksLocal()) return
+        // Captured before the append: a queue that already ran out resumes onto the new tracks.
+        val endedWithNowhereToGo =
+            player.playbackState == PlayerConstants.STATE_ENDED && !player.hasNextMediaItem()
         Logger.d("Queue", listTrack.map { it.title }.toString())
         _queueData.update {
             it.copy(
@@ -1995,6 +2194,11 @@ internal class MediaServiceHandlerImpl(
         // known to be aligned again.
         trimRadioHistoryIfNeeded()
         reorderShuffledQueue(player.getCurrentMediaTimeLine())
+        if (endedWithNowhereToGo && catalogMetadata.isNotEmpty()) {
+            Logger.d(TAG, "Queue had ended; starting an appended track")
+            player.play()
+            player.seekToNext()
+        }
     }
 
     override suspend fun updateCatalog(
@@ -2812,6 +3016,10 @@ internal class MediaServiceHandlerImpl(
             PlayerConstants.STATE_ENDED -> {
                 _simpleMediaState.value = SimpleMediaState.Ended
                 Logger.d(TAG, "onPlaybackStateChanged: Ended")
+                // The last track finished before the radio batch arrived.
+                if (endlessQueueEnabled && !player.hasNextMediaItem() && !tasteInFlight.get()) {
+                    loadMore()
+                }
             }
 
             PlayerConstants.STATE_READY -> {
@@ -2890,9 +3098,8 @@ internal class MediaServiceHandlerImpl(
             nowPlayingState.value.songEntity?.let { updateDiscordRpc(it) }
         }
         queueData.value.data.listTracks.let { list ->
-            if ((list.size > 3 || runBlocking { dataStoreManager.endlessQueue.first() == TRUE }) &&
-                list.size - player.currentMediaItemIndex < 3 &&
-                list.size - player.currentMediaItemIndex >= 0 &&
+            if ((list.size > 3 || endlessQueueEnabled) &&
+                TasteAutoplay.shouldTopUp(list.size, player.currentMediaItemIndex) &&
                 queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZED
             ) {
                 Logger.d("Check loadMore", "loadMore")

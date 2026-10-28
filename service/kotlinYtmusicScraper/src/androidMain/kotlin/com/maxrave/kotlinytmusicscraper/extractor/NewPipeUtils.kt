@@ -2,7 +2,6 @@ package com.maxrave.kotlinytmusicscraper.extractor
 
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient
 import com.maxrave.kotlinytmusicscraper.models.response.PlayerResponse
-import com.maxrave.logger.Logger
 import dev.maxrave.pipepipe.extractor.NewPipe
 import dev.maxrave.pipepipe.extractor.downloader.CancellableCall
 import dev.maxrave.pipepipe.extractor.downloader.Downloader
@@ -131,7 +130,6 @@ class NewPipeUtils(
         videoId: String,
     ): String? =
         try {
-            Logger.d("NewPipeUtils", "Getting stream url: ${format.url ?: format.signatureCipher}")
             val url =
                 format.url ?: format.signatureCipher?.let { signatureCipher ->
                     val params = parseQueryString(signatureCipher)

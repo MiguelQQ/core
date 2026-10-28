@@ -12,6 +12,7 @@
 
 package com.my.kizzy.rpc
 
+import com.maxrave.common.DiscordDesktop
 import com.my.kizzy.gateway.DiscordWebSocket
 import com.my.kizzy.gateway.entities.MeResponse
 import com.my.kizzy.gateway.entities.presence.Activity
@@ -48,13 +49,19 @@ open class KizzyRPC(
             }
         }
 
-    fun closeRPC() {
+    /**
+     * Open so [com.my.kizzy.DiscordRPC] can close a Windows IPC pipe without touching the gateway.
+     * The media handlers only call this when [isRpcRunning] is true.
+     */
+    open fun closeRPC() {
         discordWebSocket.close()
     }
 
-    fun isRpcRunning(): Boolean = discordWebSocket.isWebSocketConnected()
+    open fun isRpcRunning(): Boolean = discordWebSocket.isWebSocketConnected()
 
     open suspend fun close() {
+        // The Windows IPC sentinel is not a user token. Opening the gateway with it loops or 4004s.
+        if (DiscordDesktop.isWindowsIpcToken(token)) return
         if (!isRpcRunning()) {
             discordWebSocket.connect()
         }
@@ -85,6 +92,7 @@ open class KizzyRPC(
         status: String? = "online",
         since: Long? = null,
     ) {
+        if (DiscordDesktop.isWindowsIpcToken(token)) return
         if (!isRpcRunning()) {
             discordWebSocket.connect()
         }

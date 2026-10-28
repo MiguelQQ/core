@@ -360,6 +360,7 @@ interface DataStoreManager {
 
     fun getJVMProxy(): ProxyConfiguration?
 
+    /** Endless queue / autoplay. Absent in the store means on. */
     val endlessQueue: Flow<String>
 
     suspend fun setEndlessQueue(endlessQueue: Boolean)

@@ -1150,7 +1150,9 @@ internal class DataStoreManagerImpl(
 
     override val endlessQueue =
         settingsDataStore.data.map { preferences ->
-            preferences[ENDLESS_QUEUE] ?: FALSE
+            // Unset means on: autoplay should keep a finished playlist, album or Favorites going
+            // unless the listener has turned Endless queue off.
+            preferences[ENDLESS_QUEUE] ?: TRUE
         }
 
     override suspend fun setEndlessQueue(endlessQueue: Boolean) {
