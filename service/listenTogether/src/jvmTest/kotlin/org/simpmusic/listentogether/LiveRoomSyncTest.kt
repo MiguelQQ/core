@@ -30,6 +30,15 @@ class LiveRoomSyncTest {
         assertEquals(87125L, room.position)
         assertEquals(listOf("Ana", "Bob"), room.queueContributors)
         assertEquals(listOf(7L, 8L), room.queueIds)
+        assertEquals(listOf(false, false), room.queueAutomatic)
+    }
+    @Test fun manualFlagStaysOnTheWireAndDoesNotJumpAheadOfHandPickedSongs() {
+        val raw = """{"code":"ABC234","seq":3,"phase":"playing","host_id":"a","playing":true,"position":1,"server_time":1000,"current_qid":1,"queue":[{"qid":1,"videoId":"dQw4w9WgXcQ","automatic":false},{"qid":2,"videoId":"m1m1m1m1m1m","automatic":false},{"qid":3,"videoId":"m2m2m2m2m2m","automatic":false},{"qid":4,"videoId":"aaaaaaaaaaa","automatic":true}],"members":[]}"""
+        val room = decodeJamState(Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject, ListenTogetherState(selfUserId = "a"))
+        assertEquals(listOf("dQw4w9WgXcQ", "m1m1m1m1m1m", "m2m2m2m2m2m", "aaaaaaaaaaa"), room.queue.map { it.id })
+        assertEquals(listOf(false, false, false, true), room.queueAutomatic)
+        val upcoming = room.queueAutomatic.drop(1)
+        assertTrue(upcoming.indexOf(true) > upcoming.lastIndexOf(false))
     }
     @Test fun gateAndHostTransferDecode() {
         val raw = """{"code":"ABC234","seq":5,"phase":"loading","host_id":"a","playing":false,"position":0,"server_time":1000,"current_qid":7,"queue":[{"qid":7,"videoId":"dQw4w9WgXcQ","title":"A"}],"members":[{"id":"b","name":"B","connected":true,"loading":true}],"gate":{"waiting":["b"],"timed_out":true}}"""

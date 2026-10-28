@@ -91,6 +91,12 @@ data class ListenTogetherState(
     val queueContributors: List<String> = emptyList(),
     /** Parallel to [queue]: true when the member who added the track picked its video. */
     val queueIsVideo: List<Boolean> = emptyList(),
+    /**
+     * Parallel to [queue]. False when a person added the track (the manual block). True for the
+     * automatic mix. The server owns the order; this flag must survive decode so a recompose cannot
+     * treat a hand-picked song as mix filler.
+     */
+    val queueAutomatic: List<Boolean> = emptyList(),
 ) {
     val inRoom: Boolean get() = roomCode != null
     val isConnected: Boolean get() = connection is ConnectionState.Connected
@@ -112,7 +118,7 @@ class ListenTogetherSession internal constructor(
 
     override val coroutineContext = SupervisorJob() + dispatcher
     private val client = HttpClient(getEngine()) {
-        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.15" }
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.16" }
         install(WebSockets)
         install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
     }
@@ -137,6 +143,8 @@ class ListenTogetherSession internal constructor(
                 try {
                     send("queue_add") {
                         put("track", encodeJamTrack(addition.track, addition.isVideo))
+                        // Hand-picked. The server also forces this; sending it keeps the wire explicit.
+                        put("automatic", false)
                         if (addition.play) put("play", true)
                         addition.after?.let { put("after", it) }
                     }
@@ -267,8 +275,9 @@ class ListenTogetherSession internal constructor(
     fun removeTrack(qid: Long) = command("queue_remove") { put("qid", qid) }
     fun moveTrack(qid: Long, to: Int) = command("queue_move") { put("qid", qid); put("to", to) }
     /**
-     * [after] is the videoId of a queued track this one goes right behind; without it a plain add goes
-     * to the end and a [play] add goes right behind the track that is playing now.
+     * [after] chains a playlist right behind a track just added. Without it a plain add joins the
+     * manual FIFO block (ahead of the automatic mix) and a [play] add goes right behind the track
+     * that is playing now. [automatic] is always false: only the server's mix is automatic.
      */
     fun suggestTrack(track: TrackInfo, play: Boolean = false, isVideo: Boolean = false, after: String? = null) {
         val code = state.value.roomCode ?: return
@@ -307,6 +316,7 @@ internal fun decodeJamState(s: JsonObject, old: ListenTogetherState): ListenToge
             connection = ConnectionState.Connected("Killmon JAM"), roomCode = s.string("code"), pendingJoinCode = null,
             isHost = host == old.selfUserId, queue = queue.map(::decodeJamTrack), queueIds = queue.map { it.long("qid") }, queueContributors = queue.map { it.string("added_by") },
             queueIsVideo = queue.map { (it["is_video"] as? JsonPrimitive)?.booleanOrNull == true },
+            queueAutomatic = queue.map { (it["automatic"] as? JsonPrimitive)?.booleanOrNull == true },
             currentTrack = current?.let(::decodeJamTrack), position = ((s["position"]?.jsonPrimitive?.doubleOrNull ?: 0.0) * 1000).toLong(),
             isPlaying = s["playing"]?.jsonPrimitive?.booleanOrNull == true, lastActionServerTime = s.long("server_time"),
             seq = s.long("seq"), loading = s.string("phase") == "loading", gateTimedOut = gate?.get("timed_out")?.jsonPrimitive?.booleanOrNull == true,

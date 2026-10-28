@@ -219,7 +219,7 @@ class ListenTogetherPlaybackBridge(
                     lastRoomCode = code
                     val bare = current?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO).orEmpty()
                     if (wasEmpty && session.state.value.isHost && current != null && Regex("^[A-Za-z0-9_-]{11}$").matches(bare)) {
-                        session.command("queue_add") { put("track", kotlinx.serialization.json.buildJsonObject { put("videoId", bare); put("title", current.metadata.title.orEmpty()); put("artist", current.metadata.artist.orEmpty()); put("thumbnail", current.metadata.artworkUri.orEmpty()); if (current.metadata.description == MERGING_DATA_TYPE.VIDEO) put("isVideo", true) }); put("position", initialPosition / 1000.0) }
+                        session.command("queue_add") { put("track", kotlinx.serialization.json.buildJsonObject { put("videoId", bare); put("title", current.metadata.title.orEmpty()); put("artist", current.metadata.artist.orEmpty()); put("thumbnail", current.metadata.artworkUri.orEmpty()); if (current.metadata.description == MERGING_DATA_TYPE.VIDEO) put("isVideo", true) }); put("automatic", false); put("position", initialPosition / 1000.0) }
                     }
                 }
                 val room = session.state.value
