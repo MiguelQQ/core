@@ -118,7 +118,7 @@ class ListenTogetherSession internal constructor(
 
     override val coroutineContext = SupervisorJob() + dispatcher
     private val client = HttpClient(getEngine()) {
-        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.24" }
+        install(io.ktor.client.plugins.UserAgent) { agent = "Killmon Music/0.7.25" }
         install(WebSockets)
         install(HttpTimeout) { connectTimeoutMillis = 15_000; requestTimeoutMillis = 20_000 }
     }
