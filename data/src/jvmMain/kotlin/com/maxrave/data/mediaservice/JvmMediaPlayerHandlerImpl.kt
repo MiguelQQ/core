@@ -25,6 +25,10 @@ import com.maxrave.data.mediaservice.mac.NowPlayingInfo
 import com.maxrave.domain.data.entities.NewFormatEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.connect.ConnectPlayRouter
+import com.maxrave.domain.data.model.connect.asConnectPlayTrack
+import com.maxrave.domain.data.model.connect.indexForRemotePlay
+import com.maxrave.domain.data.model.connect.queueForRemotePlay
 import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
 import com.maxrave.domain.data.model.searchResult.songs.Artist
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint
@@ -1411,10 +1415,17 @@ class JvmMediaPlayerHandlerImpl(
         _currentSongIndex.value = player.currentMediaItemIndex
     }
 
+    private fun redirectRemote(mediaItem: GenericMediaItem): Boolean {
+        val played = mediaItem.asConnectPlayTrack()
+        val queued = queueForRemotePlay(queueData.value.data.listTracks, played)
+        return ConnectPlayRouter.redirect(queued, indexForRemotePlay(queued, played.videoId, null))
+    }
+
     override fun addMediaItem(
         mediaItem: GenericMediaItem,
         playWhenReady: Boolean,
     ) {
+        if (playWhenReady && redirectRemote(mediaItem)) return
         player.clearMediaItems()
         player.setMediaItem(mediaItem)
         player.prepare()
@@ -1432,6 +1443,8 @@ class JvmMediaPlayerHandlerImpl(
     }
 
     override fun playMediaItemInMediaSource(index: Int) {
+        val tracks = queueData.value.data.listTracks
+        if (ConnectPlayRouter.redirect(tracks, index)) return
         val i = if (player.shuffleModeEnabled) player.getUnshuffledIndex(index) else index
         player.seekTo(i, 0)
         player.prepare()
@@ -1512,6 +1525,7 @@ class JvmMediaPlayerHandlerImpl(
     }
 
     override fun loadMore() {
+        if (ConnectPlayRouter.blocksLocal()) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         // Separate local and remote data
         // Local Add Prefix to PlaylistID to differentiate between local and remote
@@ -1786,6 +1800,7 @@ class JvmMediaPlayerHandlerImpl(
     }
 
     override fun getRelated(videoId: String) {
+        if (ConnectPlayRouter.blocksLocal()) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         coroutineScope.launch {
             songRepository.getRelatedData(videoId).collect { response ->
@@ -1901,6 +1916,7 @@ class JvmMediaPlayerHandlerImpl(
         downloaded: Int,
         index: Int?,
     ) {
+        if (ConnectPlayRouter.blocksLocal()) return
         updateCatalog(downloaded, index).let {
             if (index != 0 && index != null) {
                 moveMediaItem(0, index)
@@ -1919,6 +1935,7 @@ class JvmMediaPlayerHandlerImpl(
         listTrack: ArrayList<Track>,
         isAddToQueue: Boolean,
     ) {
+        if (ConnectPlayRouter.blocksLocal()) return
         Logger.d("Queue", listTrack.map { it.title }.toString())
         _queueData.update {
             it.copy(
@@ -2414,6 +2431,10 @@ class JvmMediaPlayerHandlerImpl(
                 is SongEntity -> anyTrack.toTrack()
                 else -> return
             }
+        run {
+            val queued = queueForRemotePlay(queueData.value.data.listTracks, track)
+            if (ConnectPlayRouter.redirect(queued, indexForRemotePlay(queued, track.videoId, index))) return
+        }
         if (track.isExplicit && runBlocking { dataStoreManager.explicitContentEnabled.first() } == FALSE) {
             showToast(ToastType.ExplicitContent)
             return
@@ -2590,6 +2611,7 @@ class JvmMediaPlayerHandlerImpl(
      */
     private suspend fun restoreSavedQueue(playWhenReady: Boolean): Boolean =
         restoreQueueMutex.withLock {
+            if (ConnectPlayRouter.blocksLocal()) return@withLock false
             if (player.mediaItemCount > 0) {
                 // Already restored, or the app was running all along.
                 if (playWhenReady) player.play()

@@ -196,6 +196,7 @@ enum class HoldKind {
     TRANSPORT,
     VOLUME,
     SEEK,
+    LOAD,
 }
 
 fun holdFor(
@@ -209,6 +210,7 @@ fun holdFor(
             "play", "pause", "next", "previous" -> HoldKind.TRANSPORT
             "volume" -> HoldKind.VOLUME
             "seek" -> HoldKind.SEEK
+            "load" -> HoldKind.LOAD
             else -> return null
         }
     return PlaybackHold(
@@ -245,6 +247,10 @@ fun PlaybackHold.matches(session: ConnectSession): Boolean {
         HoldKind.TRANSPORT -> session.isPlaying == isPlaying && session.index == index
         HoldKind.VOLUME -> session.isPlaying == isPlaying && kotlin.math.abs(session.volume - volume) <= 0.02f
         HoldKind.SEEK -> session.index == index && kotlin.math.abs(session.positionMs - positionMs) <= 2_000L
+        HoldKind.LOAD ->
+            session.isPlaying &&
+                session.index == index &&
+                (videoId.isBlank() || session.currentTrack()?.videoId == videoId)
     }
 }
 

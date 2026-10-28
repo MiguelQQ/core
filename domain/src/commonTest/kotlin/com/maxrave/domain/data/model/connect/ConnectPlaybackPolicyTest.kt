@@ -1,5 +1,7 @@
 package com.maxrave.domain.data.model.connect
 
+import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.searchResult.songs.Artist
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -173,7 +175,131 @@ class ConnectPlaybackPolicyTest {
         assertEquals(null, simulateQueuedClearThenSyncAdd(listOf("abcdefghijk", "bcdefghijkl"), 1))
         assertEquals("bcdefghijkl", simulateAtomicReplace(listOf("abcdefghijk", "bcdefghijkl"), 1))
     }
+
+    @Test
+    fun pickingASongKeepsTheActiveDeviceAndAStaleSnapshotDoesNotRestoreTheOldTrack() {
+        val playing = session(playing = true, position = 20_000, at = 1_000).copy(revision = 8, volume = 0.4f)
+        val picked =
+            ConnectPlayback(
+                queue =
+                    listOf(
+                        ConnectTrack("cdefghijklm", "Tres", "C", "", 120_000),
+                    ),
+                index = 0,
+                positionMs = 0L,
+                isPlaying = true,
+                volume = 1f,
+            )
+        val loaded = playing.withLoadedQueue(picked, nowMs = 3_000)
+        assertEquals("desk-device-00002", loaded.activeDeviceId)
+        assertEquals("cdefghijklm", loaded.currentTrack()?.videoId)
+        assertEquals(0.4f, loaded.volume)
+        assertTrue(loaded.isPlaying)
+        assertEquals(0L, loaded.estimatedPositionMs(3_000))
+        val hold = holdFor("load", loaded, baseRevision = 8, nowMs = 3_000)
+        val stale = playing.copy(revision = 9)
+        val kept = mergeConnectSession(loaded, stale, hold, nowMs = 3_200)
+        assertEquals("cdefghijklm", kept.session?.currentTrack()?.videoId)
+        assertEquals("desk-device-00002", kept.session?.activeDeviceId)
+        val confirmed = loaded.copy(revision = 9)
+        val accepted = mergeConnectSession(loaded, confirmed, hold, nowMs = 3_400)
+        assertEquals("cdefghijklm", accepted.session?.currentTrack()?.videoId)
+        assertEquals(null, accepted.hold)
+    }
+
+    @Test
+    fun localPlayWhileFollowingDoesNotTakeOverAndSeekStaysOnTheLoadedFile() {
+        assertEquals(LocalPlayRoute.REMOTE_LOAD, localPlayRoute(followingRemote = true))
+        assertEquals(LocalPlayRoute.LOCAL, localPlayRoute(followingRemote = false))
+        val session = session(playing = true, position = 10_000, at = 0)
+        val same = session.toPlayback()
+        assertFalse(shouldPushLocalPick(same, session))
+        val other =
+            same.copy(
+                queue = listOf(ConnectTrack("cdefghijklm", "Tres", "C", "", 90_000)),
+                index = 0,
+            )
+        assertTrue(shouldPushLocalPick(other, session))
+        assertTrue(
+            seekAppliesInPlace(
+                action = "seek",
+                currentMediaId = "Songabcdefghijk",
+                targetVideoId = "abcdefghijk",
+                currentIndex = 0,
+                targetIndex = 0,
+                itemCount = 2,
+            ),
+        )
+        assertFalse(
+            seekAppliesInPlace(
+                action = "seek",
+                currentMediaId = "abcdefghijk",
+                targetVideoId = "bcdefghijkl",
+                currentIndex = 0,
+                targetIndex = 1,
+                itemCount = 2,
+            ),
+        )
+        assertFalse(seekAppliesInPlace("next", "abcdefghijk", "abcdefghijk", 0, 0, 2))
+        val sought = session.withControl("seek", 50_000, nowMs = 2_000)
+        assertEquals(50_000, sought.estimatedPositionMs(2_000))
+        assertEquals(51_000, sought.estimatedPositionMs(3_000))
+        val hold = holdFor("seek", sought, baseRevision = 4, nowMs = 2_000)
+        val oldPosition = session.copy(revision = 6, positionMs = 12_000, positionAtMs = 2_000)
+        val kept = mergeConnectSession(sought, oldPosition, hold, nowMs = 2_300)
+        assertEquals(50_000, kept.session?.positionMs)
+        assertTrue(kept.hold != null)
+        val paused = session.withControl("pause", null, nowMs = 4_000)
+        assertFalse(paused.isPlaying)
+        assertEquals(14_000, paused.estimatedPositionMs(9_000))
+    }
+
+    @Test
+    fun remoteQueueUsesTheTappedIndexAndDropsIdsTheProtocolRejects() {
+        val first = track("abcdefghijk", "Uno")
+        val second = track("bcdefghijkl", "Dos")
+        val broken = track("short", "No")
+        val playback = connectPlaybackFromTracks(listOf(first, broken, second), index = 2, volume = 0.4f)
+        assertEquals("bcdefghijkl", playback?.queue?.getOrNull(playback.index)?.videoId)
+        assertEquals(1, playback?.index)
+        assertEquals(0.4f, playback?.volume)
+        assertTrue(playback?.isPlaying == true)
+        val queued = queueForRemotePlay(listOf(first, second), second)
+        assertEquals(1, indexForRemotePlay(queued, second.videoId, 1))
+        assertEquals(listOf(second.videoId), queueForRemotePlay(listOf(first), second).map { it.videoId })
+        assertFalse(ConnectPlayRouter.blocksLocal())
+        ConnectPlayRouter.followingRemote = { true }
+        var sent: String? = null
+        ConnectPlayRouter.offer =
+            ConnectPlayRouter.Offer { tracks, index ->
+                sent = tracks.getOrNull(index)?.videoId
+                true
+            }
+        assertTrue(ConnectPlayRouter.redirect(listOf(first, second), 1))
+        assertEquals("bcdefghijkl", sent)
+        ConnectPlayRouter.followingRemote = { false }
+        ConnectPlayRouter.offer = null
+        assertFalse(ConnectPlayRouter.redirect(listOf(first), 0))
+    }
 }
+
+private fun track(id: String, title: String) =
+    Track(
+        album = null,
+        artists = listOf(Artist(id = null, name = "A")),
+        duration = null,
+        durationSeconds = 180,
+        isAvailable = true,
+        isExplicit = false,
+        likeStatus = null,
+        thumbnails = null,
+        title = title,
+        videoId = id,
+        videoType = null,
+        category = null,
+        feedbackTokens = null,
+        resultType = null,
+    )
 
 /** El clear encolado corre después de los add hechos en el otro hilo y se lleva la cola. */
 private fun simulateQueuedClearThenSyncAdd(items: List<String>, index: Int): String? {

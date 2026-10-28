@@ -113,6 +113,22 @@ data class ConnectSession(
             isPlaying = playing,
         )
     }
+
+    /**
+     * Una canción elegida en el controlador. El aparato activo no cambia:
+     * la cola nueva suena donde ya estaba el audio.
+     */
+    fun withLoadedQueue(playback: ConnectPlayback, nowMs: Long): ConnectSession {
+        if (playback.queue.isEmpty()) return this
+        val target = playback.index.coerceIn(0, playback.queue.lastIndex)
+        return copy(
+            queue = playback.queue,
+            index = target,
+            positionMs = playback.positionMs.coerceAtLeast(0L),
+            positionAtMs = nowMs,
+            isPlaying = true,
+        )
+    }
 }
 
 /** La misma pista, en el modelo que ya consumen la cola y Now Playing. */

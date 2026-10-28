@@ -12,7 +12,11 @@ import com.maxrave.domain.data.model.connect.connectPollIntervalMs
 import com.maxrave.domain.data.model.connect.controlAckIncludesPlayback
 import com.maxrave.domain.data.model.connect.followerNeedsSilence
 import com.maxrave.domain.data.model.connect.reportedTrackMatches
+import com.maxrave.domain.data.model.connect.connectPlaybackFromTracks
+import com.maxrave.domain.data.model.connect.ConnectPlayRouter
+import com.maxrave.domain.data.model.connect.seekAppliesInPlace
 import com.maxrave.domain.data.model.connect.shouldPublishPlayback
+import com.maxrave.domain.data.model.connect.shouldPushLocalPick
 import com.maxrave.domain.data.model.connect.toTransferLoad
 import com.maxrave.domain.data.model.connect.transferAckIncludesPlayback
 import com.maxrave.domain.data.model.connect.wasPlayingAfterControl
@@ -57,11 +61,24 @@ internal class ConnectPlaybackBridge(
     private var mirroredKey: String? = null
     private var lastPlayerKickMs = 0L
     private var suppressPlaybackUntil = 0L
+    private var ignorePlayerKickUntil = 0L
     private var expectVideoId: String? = null
 
     fun start() {
         if (started) return
         started = true
+        ConnectPlayRouter.followingRemote = {
+            connect.state.value.isFollowingRemote() && !jam.room.value.inRoom
+        }
+        ConnectPlayRouter.offer =
+            ConnectPlayRouter.Offer { tracks, index ->
+                val state = connect.state.value
+                if (!state.isFollowingRemote() || jam.room.value.inRoom) return@Offer false
+                val playback =
+                    connectPlaybackFromTracks(tracks, index, state.session?.volume ?: 1f) ?: return@Offer false
+                connect.remoteLoad(playback)
+                true
+            }
         handler.player.addListener(
             object : MediaPlayerListener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) = kickFromPlayer()
@@ -97,6 +114,7 @@ internal class ConnectPlaybackBridge(
     private fun kickFromPlayer() {
         if (applying) return
         val now = Clock.System.now().toEpochMilliseconds()
+        if (now < ignorePlayerKickUntil) return
         if (now - lastPlayerKickMs < 400L) return
         lastPlayerKickMs = now
         connect.refresh()
@@ -109,10 +127,13 @@ internal class ConnectPlaybackBridge(
         val edge = playing && !wasPlaying && !applying
         wasPlaying = playing
         val active = before.session?.activeDeviceId
-        // Play local mientras se sigue al otro aparato: eso trae la sesión aquí, no publica la cola vieja.
+        // Un play local con otro aparato activo no trae el audio aquí.
+        // Si la cola es otra canción (un toque que se coló al player), se la mandamos al activo.
         if (edge && !inJam && active != null && active != before.deviceId && before.isFollowingRemote()) {
+            val picked = withContext(Dispatchers.Main) { localPlayback() }
             yieldLocal()
-            connect.transferTo(before.deviceId)
+            silenceLocal()
+            if (shouldPushLocalPick(picked, before.session)) connect.remoteLoad(picked!!)
             return
         }
         if (!inJam && applyPending(before.command, before.session, before.deviceId)) return
@@ -172,7 +193,10 @@ internal class ConnectPlaybackBridge(
             ackedControl = command.revision
             val ready = withContext(Dispatchers.Main) { handler.player.playWhenReady }
             wasPlaying = wasPlayingAfterControl(command.action, session.isPlaying, ready)
-            suppressPlaybackUntil = Clock.System.now().toEpochMilliseconds() + 400L
+            val settleMs = if (command.action == "seek" || command.action == "load") 1_500L else 400L
+            val until = Clock.System.now().toEpochMilliseconds() + settleMs
+            suppressPlaybackUntil = until
+            ignorePlayerKickUntil = until
             if (appliedVolume != null) dataStore.setPlayerVolume(appliedVolume)
             // The ack confirms the command. Playback goes on the next heartbeat, after the backend
             // has the new play/pause. Sending both in one presence let the old is_playing win.
@@ -260,12 +284,27 @@ internal class ConnectPlaybackBridge(
                 when (action) {
                     "play" -> {
                         player.audioFocusLost = false
-                        player.playWhenReady = true
+                        player.play()
                     }
-                    "pause" -> {
-                        player.playWhenReady = false
+                    "pause" -> player.pause()
+                    "seek" -> {
+                        val targetId = session.currentTrack()?.videoId
+                        if (
+                            seekAppliesInPlace(
+                                action = "seek",
+                                currentMediaId = player.currentMediaItem?.mediaId,
+                                targetVideoId = targetId,
+                                currentIndex = player.currentMediaItemIndex,
+                                targetIndex = index,
+                                itemCount = player.mediaItemCount,
+                            )
+                        ) {
+                            player.seekTo(positionMs.coerceAtLeast(0L))
+                        } else if (player.mediaItemCount > 0) {
+                            player.seekTo(index.coerceIn(0, player.mediaItemCount - 1), positionMs.coerceAtLeast(0L))
+                        }
                     }
-                    "seek" -> player.seekTo(positionMs.coerceAtLeast(0L))
+                    "load" -> loadQueueInPlace(session)
                     "next", "previous" -> {
                         if (player.mediaItemCount > 0) player.seekTo(index.coerceIn(0, player.mediaItemCount - 1), positionMs.coerceAtLeast(0L))
                         handler.setCurrentSongIndex(index)
@@ -281,6 +320,21 @@ internal class ConnectPlaybackBridge(
             }
         }
         return appliedVolume
+    }
+
+    /** Cola nueva pedida por el otro aparato. Un solo load, en el hilo del player, sin pasar por clear suelto. */
+    private fun loadQueueInPlace(session: ConnectSession) {
+        val load = session.toTransferLoad(Clock.System.now().toEpochMilliseconds()) ?: return
+        expectVideoId = load.videoId
+        handler.player.loadPlaylistAt(
+            items = session.queue.map { mediaItem(it) },
+            index = load.index,
+            positionMs = load.positionMs,
+            play = true,
+        )
+        handler.setQueueData(queueOf(session))
+        handler.setCurrentSongIndex(load.index)
+        mirroredKey = queueKey(session)
     }
 
     private fun mirrorQueue(session: ConnectSession) {

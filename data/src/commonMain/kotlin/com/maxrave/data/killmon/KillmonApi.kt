@@ -381,6 +381,8 @@ internal data class ConnectControlBody(
     @SerialName("position_ms")
     val positionMs: Long? = null,
     val volume: Float? = null,
+    /** Solo `load`: la cola que tiene que abrir el aparato que ya suena. */
+    val playback: ConnectPlaybackBody? = null,
 )
 
 @Serializable

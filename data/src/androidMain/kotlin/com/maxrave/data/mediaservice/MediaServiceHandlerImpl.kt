@@ -36,6 +36,10 @@ import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
+import com.maxrave.domain.data.model.connect.ConnectPlayRouter
+import com.maxrave.domain.data.model.connect.asConnectPlayTrack
+import com.maxrave.domain.data.model.connect.indexForRemotePlay
+import com.maxrave.domain.data.model.connect.queueForRemotePlay
 import com.maxrave.domain.data.player.JamPlaybackRouter
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
@@ -1335,6 +1339,13 @@ internal class MediaServiceHandlerImpl(
         _currentSongIndex.value = player.currentMediaItemIndex
     }
 
+    /** La pista elegida, contra la cola ya armada (álbum, playlist, búsqueda). */
+    private fun redirectRemote(mediaItem: GenericMediaItem): Boolean {
+        val played = mediaItem.asConnectPlayTrack()
+        val queued = queueForRemotePlay(queueData.value.data.listTracks, played)
+        return ConnectPlayRouter.redirect(queued, indexForRemotePlay(queued, played.videoId, null))
+    }
+
     override fun addMediaItem(
         mediaItem: GenericMediaItem,
         playWhenReady: Boolean,
@@ -1342,6 +1353,7 @@ internal class MediaServiceHandlerImpl(
         JamPlaybackRouter.actions?.let { jam ->
             if (playWhenReady) jam.play(mediaItem) else jam.add(mediaItem); return
         }
+        if (playWhenReady && redirectRemote(mediaItem)) return
 
         player.clearMediaItems()
         player.setMediaItem(mediaItem)
@@ -1367,6 +1379,8 @@ internal class MediaServiceHandlerImpl(
 
     override fun playMediaItemInMediaSource(index: Int) {
         JamPlaybackRouter.actions?.let { it.queue("play_index", index); return }
+        val tracks = queueData.value.data.listTracks
+        if (ConnectPlayRouter.redirect(tracks, index)) return
         val i = if (player.shuffleModeEnabled) player.getUnshuffledIndex(index) else index
         player.seekTo(i, 0)
         player.prepare()
@@ -1442,7 +1456,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun loadMore() {
-        if (JamPlaybackRouter.actions != null) return
+        if (JamPlaybackRouter.actions != null || ConnectPlayRouter.blocksLocal()) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         // Separate local and remote data
         // Local Add Prefix to PlaylistID to differentiate between local and remote
@@ -1717,7 +1731,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun getRelated(videoId: String) {
-        if (JamPlaybackRouter.actions != null) return
+        if (JamPlaybackRouter.actions != null || ConnectPlayRouter.blocksLocal()) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         coroutineScope.launch {
             songRepository.getRelatedData(videoId).collect { response ->
@@ -1833,6 +1847,7 @@ internal class MediaServiceHandlerImpl(
         downloaded: Int,
         index: Int?,
     ) {
+        if (ConnectPlayRouter.blocksLocal()) return
         JamPlaybackRouter.actions?.let { jam ->
             queueData.value.data.listTracks.forEachIndexed { trackIndex, track ->
                 if (trackIndex != index) jam.add(track.toGenericMediaItem())
@@ -1857,6 +1872,7 @@ internal class MediaServiceHandlerImpl(
         listTrack: ArrayList<Track>,
         isAddToQueue: Boolean,
     ) {
+        if (ConnectPlayRouter.blocksLocal()) return
         Logger.d("Queue", listTrack.map { it.title }.toString())
         _queueData.update {
             it.copy(
@@ -2372,6 +2388,10 @@ internal class MediaServiceHandlerImpl(
             }
             return
         }
+        run {
+            val queued = queueForRemotePlay(queueData.value.data.listTracks, track)
+            if (ConnectPlayRouter.redirect(queued, indexForRemotePlay(queued, track.videoId, index))) return
+        }
         if (track.isExplicit && dataStoreManager.explicitContentEnabled.first() == FALSE) {
             showToast(ToastType.ExplicitContent)
             return
@@ -2610,6 +2630,8 @@ internal class MediaServiceHandlerImpl(
      */
     private suspend fun restoreSavedQueue(playWhenReady: Boolean): Boolean =
         restoreQueueMutex.withLock {
+            // Con Windows (u otro aparato) activo, restaurar la cola de este teléfono le quitaría el audio.
+            if (ConnectPlayRouter.blocksLocal()) return@withLock false
             if (player.mediaItemCount > 0) {
                 // Already restored, or the app was running all along.
                 if (playWhenReady || playRequestedDuringRestore) requestPlayWhenReady()

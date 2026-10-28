@@ -1,5 +1,6 @@
 package com.maxrave.domain.repository
 
+import com.maxrave.domain.data.model.connect.ConnectPlayback
 import com.maxrave.domain.data.model.connect.ConnectState
 import kotlinx.coroutines.flow.StateFlow
 
@@ -22,4 +23,10 @@ interface AccountConnectRepository {
         positionMs: Long? = null,
         volume: Float? = null,
     )
+
+    /**
+     * Sustituye la cola del aparato activo y la pone a sonar ahí.
+     * No transfiere el audio a este dispositivo.
+     */
+    fun remoteLoad(playback: ConnectPlayback)
 }
