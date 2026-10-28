@@ -117,28 +117,35 @@ data class MusicResponsiveListItemRenderer(
                 ?.pageType == MUSIC_PAGE_TYPE_ARTIST
 
     /**
-     * The song/video id. YouTube (web, 2026) dropped [playlistItemData] from search items, so we
-     * fall back to the overlay play button and then the first flex column's watch endpoint.
+     * The song/video id of this row.
+     *
+     * [playlistItemData] is the row's own id. The title column is next: it is the watch endpoint
+     * of the text the cell shows. The overlay play button is only a fallback — on Home it often
+     * starts a radio whose videoId is a different track than the title.
      */
     val videoId: String?
         get() =
-            playlistItemData?.videoId
-                ?: overlay
-                    ?.musicItemThumbnailOverlayRenderer
-                    ?.content
-                    ?.musicPlayButtonRenderer
-                    ?.playNavigationEndpoint
-                    ?.watchEndpoint
-                    ?.videoId
-                ?: flexColumns
-                    .firstOrNull()
-                    ?.musicResponsiveListItemFlexColumnRenderer
-                    ?.text
-                    ?.runs
-                    ?.firstOrNull()
-                    ?.navigationEndpoint
-                    ?.watchEndpoint
-                    ?.videoId
+            preferredSongVideoId(
+                playlistItemId = playlistItemData?.videoId,
+                titleWatchId =
+                    flexColumns
+                        .firstOrNull()
+                        ?.musicResponsiveListItemFlexColumnRenderer
+                        ?.text
+                        ?.runs
+                        ?.firstOrNull()
+                        ?.navigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId,
+                overlayWatchId =
+                    overlay
+                        ?.musicItemThumbnailOverlayRenderer
+                        ?.content
+                        ?.musicPlayButtonRenderer
+                        ?.playNavigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId,
+            )
 
     /**
      * The album/playlist id from the play button. The play endpoint switched from
@@ -240,3 +247,16 @@ data class MusicResponsiveListItemRenderer(
         }
     }
 }
+
+/**
+ * Id of the row the user can see. The title's watch endpoint wins over the overlay play button,
+ * which on Home can point at a different track (the radio) than the title on the cell.
+ */
+fun preferredSongVideoId(
+    playlistItemId: String?,
+    titleWatchId: String?,
+    overlayWatchId: String?,
+): String? =
+    playlistItemId?.takeIf { it.isNotBlank() }
+        ?: titleWatchId?.takeIf { it.isNotBlank() }
+        ?: overlayWatchId?.takeIf { it.isNotBlank() }
