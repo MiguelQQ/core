@@ -1,137 +1,55 @@
 package org.simpmusic.listentogether
 
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.test.Ignore
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlin.test.*
+import kotlinx.serialization.json.Json
 
-/**
- * Two real clients, one real room, against the public server.
- *
- * This is the test that answers "you join and then nothing happens": it drives a host and a guest
- * through the whole sequence — create, request, approve, and a transport command — and asserts the
- * guest's state actually moved. Nothing below is mocked; if the server, the codec or the session
- * disagree anywhere, one of these assertions fails.
- *
- * Network-dependent and it creates a room on someone else's server, so it is `@Ignore`d. Delete the
- * annotation to run it.
- */
 class LiveRoomSyncTest {
-    /** Generous: this is a real network hop to Poland, not a latency assertion. */
-    private val MAX_TRAVEL_MS = 5_000L
-
-    private fun session(version: String) =
-        ListenTogetherSession(
-            ListenTogetherClient(
-                clientVersion = version,
-                userAgent = "SimpMusic/test (org.simpmusic.test; JVM)",
-            ),
-        )
-
-    private suspend fun <T> eventually(
-        label: String,
-        timeoutMs: Long = 25_000,
-        block: () -> T?,
-    ): T? =
-        withTimeoutOrNull(timeoutMs) {
-            while (true) {
-                block()?.let { return@withTimeoutOrNull it }
-                delay(150)
-            }
-            @Suppress("UNREACHABLE_CODE")
-            null
-        }.also { if (it == null) println("  ✗ timed out waiting for $label") }
-
-
-
-    @Ignore
-    @Test
-    fun aGuestFollowsTheHostThroughARealRoom() =
-        runBlocking {
-            val host = session("simpmusic-host-test")
-            val guest = session("simpmusic-guest-test")
-
-            try {
-                host.connect()
-                guest.connect()
-                assertNotNull(eventually("host connected") { host.state.value.isConnected.takeIf { it } }, "host never connected")
-                assertNotNull(eventually("guest connected") { guest.state.value.isConnected.takeIf { it } }, "guest never connected")
-                println("✓ both clients connected")
-
-                host.createRoom("HostUser")
-                val code = eventually("room_created") { host.state.value.roomCode }
-                assertNotNull(code, "host never got a room")
-                assertTrue(host.state.value.isHost, "creator should be host")
-                println("✓ room $code created")
-
-                guest.joinRoom(code, "GuestUser")
-                val request = eventually("join_request") { host.state.value.joinRequests.firstOrNull() }
-                assertNotNull(request, "host never saw the join request")
-                assertEquals("GuestUser", request.username)
-                println("✓ host received the join request")
-
-                host.approveJoin(request.userId)
-                assertNotNull(eventually("join_approved") { guest.state.value.roomCode }, "guest never got in")
-                assertTrue(!guest.state.value.isHost, "guest must not be host")
-                println("✓ guest is in the room")
-
-                // The whole point: a transport command issued by the host reaches the guest.
-                val roomQueue =
-                    listOf(
-                        TrackInfo(id = "dQw4w9WgXcQ", title = "Test Track", artist = "Tester", duration = 180_000L),
-                        TrackInfo(id = "9bZkp7q19f0", title = "Second", artist = "Tester", duration = 120_000L),
-                        TrackInfo(id = "kJQP7kiw5Fk", title = "Third", artist = "Tester", duration = 150_000L),
-                    )
-                host.sendPlaybackAction(
-                    action = PlaybackActions.CHANGE_TRACK,
-                    trackId = "dQw4w9WgXcQ",
-                    position = 0L,
-                    trackInfo = roomQueue.first(),
-                    queue = roomQueue,
-                    queueTitle = "Test Queue",
-                )
-                val track = eventually("track on guest") { guest.state.value.currentTrack?.takeIf { it.id.isNotBlank() } }
-                assertNotNull(track, "the guest never received the host's track")
-                assertEquals("dQw4w9WgXcQ", track.id)
-                println("✓ guest received the track: ${track.title}")
-
-                // The queue must ride along with the track, not arrive separately — a guest with
-                // only the current track plays its own next song and the room splits.
-                // The server keeps the queue as UPCOMING tracks only — `sanitizeUpcomingQueue`
-                // strips whatever is currently playing — so three sent comes back as two.
-                val gotQueue = eventually("queue on guest") { guest.state.value.queue.takeIf { it.size >= 2 } }
-                assertNotNull(gotQueue, "the guest never received the host's queue")
-                assertEquals(listOf("9bZkp7q19f0", "kJQP7kiw5Fk"), gotQueue.map { it.id })
-                println("✓ guest received the whole queue: ${gotQueue.map { it.title }}")
-
-                host.sendPlaybackAction(PlaybackActions.PLAY, "dQw4w9WgXcQ", 12_345L, null)
-                val playing = eventually("play on guest") { guest.state.value.takeIf { it.isPlaying } }
-                assertNotNull(playing, "the guest never saw PLAY")
-                // NOT assertEquals: the server advances the position by the time the command spent
-                // in flight, which is the synchronisation working rather than a mismatch. A first
-                // run saw 12_518 for a sent 12_345 — 173 ms of travel.
-                val drift = playing.position - 12_345L
-                assertTrue(
-                    drift in 0..MAX_TRAVEL_MS,
-                    "position should arrive advanced by travel time, not $drift ms off",
-                )
-                println("✓ guest received PLAY at ${playing.position} (advanced ${drift}ms in flight)")
-
-                // Members list must show both, with exactly one host.
-                val members = eventually("members") { guest.state.value.members.takeIf { it.size >= 2 } }
-                assertNotNull(members, "guest never saw a full member list")
-                println("✓ guest sees ${members.size} members")
-
-                host.leaveRoom()
-                guest.leaveRoom()
-                delay(300)
-            } finally {
-                host.release()
-                guest.release()
-            }
-        }
+    @Test fun driftThreshold() {
+        assertFalse(JamSync.needsSeek(1000, 1500))
+        assertTrue(JamSync.needsSeek(1000, 1501))
+        assertTrue(JamSync.needsSeek(1501, 1000))
+    }
+    @Test fun readyUsesExoPlayerStateWithoutAdditionalBufferRequirement() {
+        assertFalse(JamSync.ready(1))
+        assertFalse(JamSync.ready(2))
+        assertTrue(JamSync.ready(3))
+        assertFalse(JamSync.ready(4))
+    }
+    @Test fun queueCodecUsesMillisecondsAndServerFields() {
+        val track = TrackInfo(id = "dQw4w9WgXcQ", title = "Título", artist = "Artista", duration = 123000)
+        val encoded = encodeJamTrack(track)
+        assertEquals(123000, encoded.long("durationMs"))
+        val snapshot = Json.parseToJsonElement("""{"videoId":"dQw4w9WgXcQ","title":"Título","artist":"Artista","duration_ms":123000,"unknown":true}""").let { it as kotlinx.serialization.json.JsonObject }
+        assertEquals(track, decodeJamTrack(snapshot))
+    }
+    @Test fun loadingSnapshotKeepsAdvancedPositionAndContributors() {
+        val raw = """{"code":"ABC234","seq":8,"phase":"loading","host_id":"a","playing":false,"position":87.125,"server_time":1000,"current_qid":7,"queue":[{"qid":7,"videoId":"dQw4w9WgXcQ","added_by":"Ana"},{"qid":8,"videoId":"aaaaaaaaaaa","added_by":"Bob"}],"members":[],"gate":{"waiting":["b"],"timed_out":false}}"""
+        val room = decodeJamState(Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject, ListenTogetherState(selfUserId = "b"))
+        assertTrue(room.loading)
+        assertFalse(room.isPlaying)
+        assertEquals(87125L, room.position)
+        assertEquals(listOf("Ana", "Bob"), room.queueContributors)
+        assertEquals(listOf(7L, 8L), room.queueIds)
+        assertEquals(listOf(false, false), room.queueAutomatic)
+    }
+    @Test fun manualFlagStaysOnTheWireAndDoesNotJumpAheadOfHandPickedSongs() {
+        val raw = """{"code":"ABC234","seq":3,"phase":"playing","host_id":"a","playing":true,"position":1,"server_time":1000,"current_qid":1,"queue":[{"qid":1,"videoId":"dQw4w9WgXcQ","automatic":false},{"qid":2,"videoId":"m1m1m1m1m1m","automatic":false},{"qid":3,"videoId":"m2m2m2m2m2m","automatic":false},{"qid":4,"videoId":"aaaaaaaaaaa","automatic":true}],"members":[]}"""
+        val room = decodeJamState(Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject, ListenTogetherState(selfUserId = "a"))
+        assertEquals(listOf("dQw4w9WgXcQ", "m1m1m1m1m1m", "m2m2m2m2m2m", "aaaaaaaaaaa"), room.queue.map { it.id })
+        assertEquals(listOf(false, false, false, true), room.queueAutomatic)
+        val upcoming = room.queueAutomatic.drop(1)
+        assertTrue(upcoming.indexOf(true) > upcoming.lastIndexOf(false))
+    }
+    @Test fun gateAndHostTransferDecode() {
+        val raw = """{"code":"ABC234","seq":5,"phase":"loading","host_id":"a","playing":false,"position":0,"server_time":1000,"current_qid":7,"queue":[{"qid":7,"videoId":"dQw4w9WgXcQ","title":"A"}],"members":[{"id":"b","name":"B","connected":true,"loading":true}],"gate":{"waiting":["b"],"timed_out":true}}"""
+        val json = Json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject
+        val loading = decodeJamState(json, ListenTogetherState(selfUserId = "b"))
+        assertTrue(loading.loading); assertFalse(loading.isHost); assertTrue(loading.gateTimedOut)
+        assertEquals(listOf("b"), loading.waitingFor); assertTrue(loading.members.single().isBuffering)
+        assertEquals(5L, loading.seq); assertEquals(listOf(7L), loading.queueIds)
+        val transferred = decodeJamState(Json.parseToJsonElement(raw.replace("\"host_id\":\"a\"", "\"host_id\":\"b\"")) as kotlinx.serialization.json.JsonObject, loading)
+        assertTrue(transferred.isHost)
+        val idle = decodeJamState(Json.parseToJsonElement("""{"code":"ABC234","phase":"idle","queue":[],"members":[]}""") as kotlinx.serialization.json.JsonObject, loading)
+        assertNull(idle.currentTrack); assertTrue(idle.queue.isEmpty()); assertTrue(idle.waitingFor.isEmpty())
+    }
 }

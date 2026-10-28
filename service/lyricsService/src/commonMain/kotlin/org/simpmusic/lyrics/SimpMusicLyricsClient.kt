@@ -123,31 +123,20 @@ class SimpMusicLyricsClient {
         q_artist: String,
         duration: Int?,
     ) = runCatching {
-        val rs =
+        // Field search first. A loose `q` is only a second list, and it still has to pass
+        // title + artist + duration. The first row is never taken on its own.
+        val fielded =
+            runCatching {
+                lyricsService
+                    .searchLrclibLyrics(q_track = q_track, q_artist = q_artist, byField = true)
+                    .body<List<LrclibObject>>()
+            }.getOrElse { emptyList() }
+        pickLrclib(fielded, q_track, q_artist, duration)?.toParsedLyrics()?.let { return@runCatching it }
+        val fuzzy =
             lyricsService
-                .searchLrclibLyrics(
-                    q_track = q_track,
-                    q_artist = q_artist,
-                ).body<List<LrclibObject>>()
-        val lrclibObject: LrclibObject? =
-            if (duration != null) {
-                rs.find { abs(it.duration.toInt() - duration) <= 10 }
-            } else {
-                rs.firstOrNull()
-            }
-        if (lrclibObject != null) {
-            val syncedLyrics = lrclibObject.syncedLyrics
-            val plainLyrics = lrclibObject.plainLyrics
-            if (!syncedLyrics.isNullOrEmpty()) {
-                parseSyncedLyrics(syncedLyrics)
-            } else if (!plainLyrics.isNullOrEmpty()) {
-                parseUnsyncedLyrics(plainLyrics)
-            } else {
-                null
-            }
-        } else {
-            null
-        }
+                .searchLrclibLyrics(q_track = q_track, q_artist = q_artist, byField = false)
+                .body<List<LrclibObject>>()
+        pickLrclib(fuzzy, q_track, q_artist, duration)?.toParsedLyrics()
     }
 
     suspend fun searchBetterLyrics(
@@ -313,3 +302,28 @@ class SimpMusicLyricsClient {
         }
     }
 }
+
+private fun pickLrclib(
+    results: List<LrclibObject>,
+    title: String,
+    artist: String,
+    duration: Int?,
+): LrclibObject? =
+    results
+        .filter {
+            lyricsIdentityMatches(
+                expectedTitle = title,
+                expectedArtist = artist,
+                expectedDurationSeconds = duration,
+                candidateTitle = it.trackName,
+                candidateArtist = it.artistName,
+                candidateDurationSeconds = it.duration.toInt(),
+            )
+        }.minByOrNull { abs(it.duration - (duration ?: 0).toFloat()) }
+
+private fun LrclibObject.toParsedLyrics() =
+    when {
+        !syncedLyrics.isNullOrEmpty() -> parseSyncedLyrics(syncedLyrics)
+        !plainLyrics.isNullOrEmpty() -> parseUnsyncedLyrics(plainLyrics)
+        else -> null
+    }

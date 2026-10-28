@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.StateFlow
  * after that means the user must sign in.
  */
 interface KillmonAccountRepository {
+    suspend fun jamAccessToken(): String? = null
+
     /** False until the stored session has been read and, if present, checked once. */
     val ready: StateFlow<Boolean>
 

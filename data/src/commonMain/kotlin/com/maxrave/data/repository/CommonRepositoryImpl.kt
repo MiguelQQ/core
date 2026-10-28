@@ -18,6 +18,7 @@ import com.maxrave.spotify.Spotify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
@@ -50,6 +51,17 @@ internal class CommonRepositoryImpl(
         dataStoreManager: DataStoreManager,
         isDevBuild: Boolean,
     ) {
+        // Read settings before constructing each request. Observers alone race the first Home
+        // load and requests started immediately after the user changes country.
+        youTube.localeProvider = {
+            val country = dataStoreManager.location.first()
+            val language = dataStoreManager.language.first()
+            youTube.visitorData = dataStoreManager.visitorData.first().ifBlank { null }
+            YouTubeLocale(
+                country,
+                if (language.startsWith("es")) "es-419" else language.substringBefore('-').ifBlank { "es-419" },
+            )
+        }
         youTube.cookiePath = cookiePath.toPath()
         coroutineScope.launch {
             val resetSpotifyToken =
@@ -59,30 +71,11 @@ internal class CommonRepositoryImpl(
                     dataStoreManager.setSpotifyClientTokenExpires(Clock.System.now().epochSeconds)
                     dataStoreManager.setSpotifyPersonalTokenExpires(Clock.System.now().epochSeconds)
                 }
-            val localeJob =
-                launch {
-                    combine(dataStoreManager.location, dataStoreManager.language) { location, language ->
-                        Pair(location, language)
-                    }.collectLatest { (location, language) ->
-                        youTube.locale =
-                            YouTubeLocale(
-                                location,
-                                try {
-                                    language.substring(0..1)
-                                } catch (e: Exception) {
-                                    "en"
-                                },
-                            )
-                    }
-                }
             val ytCookieJob =
                 launch {
                     dataStoreManager.cookie.distinctUntilChanged().collectLatest { cookie ->
                         if (cookie.isNotEmpty()) {
                             youTube.cookie = cookie
-                            youTube.visitorData()?.let {
-                                youTube.visitorData = it
-                            }
                         } else {
                             youTube.cookie = null
                         }
@@ -159,12 +152,6 @@ internal class CommonRepositoryImpl(
                 launch {
                     dataStoreManager.dataSyncId.collectLatest { dataSyncId ->
                         youTube.dataSyncId = dataSyncId
-                    }
-                }
-            val visitorDataJob =
-                launch {
-                    dataStoreManager.visitorData.collectLatest { visitorData ->
-                        youTube.visitorData = visitorData
                     }
                 }
             // Observe job: push cached TIDAL credentials from DataStore into YouTube.
@@ -281,13 +268,11 @@ internal class CommonRepositoryImpl(
                     }
                 }
 
-            localeJob.join()
             ytCookieJob.join()
             pageIdJob.join()
             authUserJob.join()
             usingProxy.join()
             dataSyncIdJob.join()
-            visitorDataJob.join()
             resetSpotifyToken.join()
             aiClientProviderJob.join()
             aiClientApiKeyJob.join()

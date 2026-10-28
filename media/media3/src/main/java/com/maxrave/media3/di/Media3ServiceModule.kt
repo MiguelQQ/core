@@ -73,6 +73,7 @@ import com.maxrave.media3.service.download.DownloadUtils
 import com.maxrave.media3.service.mediasourcefactory.LiveStreamAwareLoadErrorHandlingPolicy
 import com.maxrave.media3.service.mediasourcefactory.LiveStreamDetectedException
 import com.maxrave.media3.service.mediasourcefactory.MergingMediaSourceFactory
+import com.maxrave.media3.service.prefetch.NextTrackPrefetcher
 import com.maxrave.media3.service.mediasourcefactory.liveStreamDataSourceFactory
 import com.maxrave.media3.utils.CoilBitmapLoader
 import kotlinx.coroutines.CoroutineScope
@@ -198,6 +199,16 @@ private val mediaServiceModule =
                 mediaSourceFactory = get(),
                 audioAttributes = get(),
                 streamRepository = get(),
+                prefetcher =
+                    NextTrackPrefetcher(
+                        context = androidContext(),
+                        scope = get(named(SERVICE_SCOPE)),
+                        playerCache = get(named(PLAYER_CACHE)),
+                        downloadCache = get(named(DOWNLOAD_CACHE)),
+                        upstreamFactory = provideHttpDataSourceFactory(androidContext(), provideProxy(get())),
+                        streamRepository = get(),
+                        dataStoreManager = get(),
+                    ),
             )
         }
 
@@ -337,9 +348,9 @@ private fun provideResolvingDataSourceFactory(
             } else {
                 streamRepository.getNewFormat(mediaId).lastOrNull()?.let {
                     val audioUrl = it.audioUrl
-                    if (audioUrl != null && it.expiredTime > now()) {
+                    if (audioUrl != null && it.expiredTime > now() && streamRepository.useCachedAudio(mediaId, it.itag)) {
                         Logger.d("Stream", audioUrl)
-                        Logger.d("Stream", "Audio from format")
+                        Logger.d("Stream", "Audio from format itag ${it.itag} bitrate ${it.bitrate}")
                         val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
                         Logger.d("Stream", "is 403 $is403Url")
                         if (!is403Url) {

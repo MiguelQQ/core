@@ -31,7 +31,7 @@ interface HomeRepository {
         musicVideoString: String,
     ): Flow<Resource<List<HomeItem>>>
 
-    fun getChartData(countryCode: String = "KR"): Flow<Resource<Chart>>
+    fun getChartData(countryCode: String = "CO"): Flow<Resource<Chart>>
 
     fun getMoodAndMomentsData(): Flow<Resource<Mood>>
 

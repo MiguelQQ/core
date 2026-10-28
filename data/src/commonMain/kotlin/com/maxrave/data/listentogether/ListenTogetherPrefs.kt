@@ -1,13 +1,6 @@
 package com.maxrave.data.listentogether
 
-/**
- * DataStore keys for Listen Together.
- *
- * They live here rather than next to the settings screen because both sides need them: the screen
- * writes them, and the DI module that builds the client reads the server URL before any screen
- * exists. Two copies of these strings would drift silently — the setting would appear to save and
- * the client would keep using the default.
- */
+/** Legacy preference keys. SERVER_URL is removed by migration and never used for routing. */
 object ListenTogetherPrefs {
     const val SERVER_URL = "lt_server_url"
     const val AUTO_APPROVE_JOINS = "lt_auto_approve_joins"

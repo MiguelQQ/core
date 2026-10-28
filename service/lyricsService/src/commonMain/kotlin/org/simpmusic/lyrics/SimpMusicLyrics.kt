@@ -183,9 +183,16 @@ class SimpMusicLyrics {
     suspend fun searchLrclibLyrics(
         q_track: String,
         q_artist: String,
+        byField: Boolean,
     ) = httpClient.get("https://lrclib.net/api/search") {
         buildDefaultHeaders()
-        parameter("q", "$q_artist $q_track")
+        if (byField) {
+            // Field search, not a bag of words: `q` ranks any track that shares a token.
+            parameter("track_name", q_track)
+            parameter("artist_name", q_artist)
+        } else {
+            parameter("q", "$q_artist $q_track")
+        }
     }
 
     suspend fun searchBetterLyrics(

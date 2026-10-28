@@ -126,7 +126,7 @@ internal class DownloadUtils(
                 } else {
                     streamRepository.getNewFormat(mediaId).lastOrNull()?.let {
                         val audioUrl = it.audioUrl
-                        if (audioUrl != null && it.expiredTime > now()) {
+                        if (audioUrl != null && it.expiredTime > now() && streamRepository.useCachedAudio(mediaId, it.itag)) {
                             Logger.d("Stream", audioUrl)
                             Logger.d("Stream", "Audio from format")
                             val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false

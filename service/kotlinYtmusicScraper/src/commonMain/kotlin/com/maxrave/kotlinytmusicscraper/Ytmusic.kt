@@ -35,6 +35,8 @@ import com.maxrave.ktorext.encoding.brotli
 import com.maxrave.ktorext.getEngine
 import com.maxrave.logger.Logger
 import io.ktor.client.HttpClient
+import io.ktor.client.engine.HttpClientEngineConfig
+import io.ktor.client.engine.HttpClientEngineFactory
 import io.ktor.client.engine.ProxyConfig
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.HttpRedirect
@@ -98,7 +100,9 @@ private const val DOWNLOAD_USER_AGENT =
 private const val DEFAULT_PARALLEL_DOWNLOADS = 4
 private const val CHUNK_SIZE = 1024L * 1024L // 1MB per chunk
 
-class Ytmusic {
+class Ytmusic(
+    private val engineFactory: HttpClientEngineFactory<HttpClientEngineConfig> = getEngine(),
+) {
     val normalJson =
         Json {
             ignoreUnknownKeys = true
@@ -109,7 +113,7 @@ class Ytmusic {
     private var downloadClient: HttpClient? = null
 
     private fun getDownloadClient(): HttpClient =
-        downloadClient ?: HttpClient(getEngine()) {
+        downloadClient ?: HttpClient(engineFactory) {
             expectSuccess = true
             install(HttpRedirect) {
                 checkHttpMethod = false
@@ -123,9 +127,15 @@ class Ytmusic {
 
     var locale =
         YouTubeLocale(
-            gl = getCountry(),
-            hl = getLanguage(),
+            gl = "CO",
+            hl = "es-419",
         )
+    var localeProvider: (suspend () -> YouTubeLocale)? = null
+
+    private suspend fun refreshLocale() {
+        localeProvider?.let { locale = it() }
+    }
+
     var visitorData: String? = null
     var dataSyncId: String? = null
     private var poTokenChallengeRequestKey = "O43z0dpjhgX20SCx4KAo"
@@ -168,7 +178,7 @@ class Ytmusic {
 
     @OptIn(ExperimentalSerializationApi::class)
     private fun createClient() =
-        HttpClient(getEngine()) {
+        HttpClient(engineFactory) {
             expectSuccess = true
             install(CurlLogger) {
                 logger = { Logger.d(TAG, it) }
@@ -228,12 +238,13 @@ class Ytmusic {
     internal fun HttpRequestBuilder.mask(value: String = "*") = header("X-Goog-FieldMask", value)
 
     @OptIn(ExperimentalTime::class)
-    private fun HttpRequestBuilder.ytClient(
+    private suspend fun HttpRequestBuilder.ytClient(
         client: YouTubeClient,
         setLogin: Boolean = false,
         isUsingReferer: Boolean = true,
         customCookie: String? = null,
     ) {
+        refreshLocale()
         contentType(ContentType.Application.Json)
         headers {
             append("X-Goog-Api-Format-Version", "1")
@@ -319,10 +330,13 @@ class Ytmusic {
                     if (playlistId != null) "$it&list=$playlistId" else it
                 },
         ) {
+            refreshLocale()
+            parameter("gl", locale.gl)
+            parameter("hl", locale.hl)
             headers {
                 header("Connection", "close")
                 header("Host", "www.youtube.com")
-                header("Cookie", if (cookie.isNullOrEmpty()) "PREF=hl=en&tz=UTC; SOCS=CAI" else cookie)
+                header("Cookie", if (cookie.isNullOrEmpty()) "PREF=hl=${locale.hl}&gl=${locale.gl}&tz=UTC; SOCS=CAI" else cookie)
                 header("Sec-Fetch-Mode", "navigate")
                 header(
                     "User-Agent",
@@ -407,6 +421,7 @@ class Ytmusic {
         videoId: String,
         anonymousVisitorData: String,
     ) = httpClient.post("https://www.youtube.com/youtubei/v1/player") {
+            refreshLocale()
             contentType(ContentType.Application.Json)
             header(HttpHeaders.UserAgent, ANDROID.userAgent)
             header("X-YouTube-Client-Name", "${ANDROID.xClientName}")
@@ -429,6 +444,7 @@ class Ytmusic {
         visitorData: String?,
         poToken: String,
     ) = httpClient.post("https://www.youtube.com/youtubei/v1/player") {
+        refreshLocale()
         accept(ContentType.Application.Json)
         contentType(ContentType.Application.Json)
         header("Host", "www.youtube.com")
@@ -519,7 +535,10 @@ class Ytmusic {
     }
 
     suspend fun getSuggestQuery(query: String) =
-        httpClient.get("http://suggestqueries.google.com/complete/search") {
+        httpClient.get("https://suggestqueries.google.com/complete/search") {
+            refreshLocale()
+            parameter("gl", locale.gl)
+            parameter("hl", locale.hl)
             contentType(ContentType.Application.Json)
             parameter("client", "firefox")
             parameter("ds", "yt")
@@ -922,7 +941,11 @@ class Ytmusic {
         )
     }
 
-    suspend fun getSwJsData() = httpClient.get("https://music.youtube.com/sw.js_data")
+    suspend fun getSwJsData() = httpClient.get("https://music.youtube.com/sw.js_data") {
+        refreshLocale()
+        parameter("gl", locale.gl)
+        parameter("hl", locale.hl)
+    }
 
     suspend fun accountMenu(
         customCookie: String? = null,

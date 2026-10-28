@@ -166,6 +166,55 @@ internal class KillmonApi {
         }
     }
 
+    suspend fun presence(
+        accessToken: String,
+        body: ConnectPresenceBody,
+    ): ApiOutcome<ConnectWire> = authedJson("PUT", "me/devices/presence", accessToken, body)
+
+    suspend fun transfer(
+        accessToken: String,
+        body: ConnectTransferBody,
+    ): ApiOutcome<ConnectWire> = authedJson("POST", "me/devices/transfer", accessToken, body)
+
+    suspend fun control(
+        accessToken: String,
+        body: ConnectControlBody,
+    ): ApiOutcome<ConnectWire> = authedJson("POST", "me/devices/control", accessToken, body)
+
+    suspend fun bye(
+        accessToken: String,
+        body: ConnectByeBody,
+    ): ApiOutcome<ConnectWire> = authedJson("POST", "me/devices/bye", accessToken, body)
+
+    private suspend inline fun <reified B> authedJson(
+        method: String,
+        path: String,
+        accessToken: String,
+        body: B,
+    ): ApiOutcome<ConnectWire> {
+        val response =
+            when (method) {
+                "PUT" ->
+                    client.put("$BASE/$path") {
+                        header("Authorization", "Bearer $accessToken")
+                        contentType(ContentType.Application.Json)
+                        setBody(body)
+                    }
+                else ->
+                    client.post("$BASE/$path") {
+                        header("Authorization", "Bearer $accessToken")
+                        contentType(ContentType.Application.Json)
+                        setBody(body)
+                    }
+            }
+        if (response.status != HttpStatusCode.OK) return response.failure()
+        return try {
+            ApiOutcome.Success(response.body())
+        } catch (_: Exception) {
+            response.failure()
+        }
+    }
+
     private fun parsePrefs(text: String): ApiOutcome<PrefsPayload> {
         val obj = runCatching { json.parseToJsonElement(text) as JsonObject }.getOrNull()
             ?: return ApiOutcome.Failure(0, null, text.ifBlank { null }, null, null)
@@ -299,6 +348,109 @@ private data class UserBody(
             createdAt = createdAt,
         )
 }
+
+@Serializable
+internal data class ConnectPresenceBody(
+    @SerialName("device_id")
+    val deviceId: String,
+    val platform: String,
+    @SerialName("display_name")
+    val displayName: String,
+    val playback: ConnectPlaybackBody? = null,
+    val takeover: Boolean = false,
+    @SerialName("ack_transfer")
+    val ackTransfer: Long? = null,
+    @SerialName("ack_control")
+    val ackControl: Long? = null,
+)
+
+@Serializable
+internal data class ConnectTransferBody(
+    @SerialName("device_id")
+    val deviceId: String,
+    @SerialName("target_device_id")
+    val targetDeviceId: String,
+    val playback: ConnectPlaybackBody? = null,
+)
+
+@Serializable
+internal data class ConnectControlBody(
+    @SerialName("device_id")
+    val deviceId: String,
+    val action: String,
+    @SerialName("position_ms")
+    val positionMs: Long? = null,
+)
+
+@Serializable
+internal data class ConnectByeBody(
+    @SerialName("device_id")
+    val deviceId: String,
+)
+
+@Serializable
+internal data class ConnectPlaybackBody(
+    val queue: List<ConnectTrackBody>,
+    val index: Int,
+    @SerialName("position_ms")
+    val positionMs: Long,
+    @SerialName("is_playing")
+    val isPlaying: Boolean,
+)
+
+@Serializable
+internal data class ConnectTrackBody(
+    @SerialName("video_id")
+    val videoId: String,
+    val title: String = "",
+    val artist: String = "",
+    val thumbnail: String = "",
+    @SerialName("duration_ms")
+    val durationMs: Long = 0,
+)
+
+@Serializable
+internal data class ConnectWire(
+    val devices: List<ConnectDeviceWire> = emptyList(),
+    val session: ConnectSessionWire? = null,
+    val command: ConnectCommandWire? = null,
+)
+
+@Serializable
+internal data class ConnectDeviceWire(
+    @SerialName("device_id")
+    val deviceId: String = "",
+    val platform: String = "",
+    @SerialName("display_name")
+    val displayName: String = "",
+    @SerialName("is_active")
+    val isActive: Boolean = false,
+    @SerialName("is_self")
+    val isSelf: Boolean = false,
+)
+
+@Serializable
+internal data class ConnectSessionWire(
+    @SerialName("active_device_id")
+    val activeDeviceId: String = "",
+    val revision: Long = 0,
+    @SerialName("is_playing")
+    val isPlaying: Boolean = false,
+    @SerialName("position_ms")
+    val positionMs: Long = 0,
+    val index: Int = 0,
+    val queue: List<ConnectTrackBody> = emptyList(),
+)
+
+@Serializable
+internal data class ConnectCommandWire(
+    val type: String = "",
+    val revision: Long = 0,
+    val action: String? = null,
+    @SerialName("position_ms")
+    val positionMs: Long? = null,
+    val index: Int? = null,
+)
 
 private object FlexibleStringSerializer : KSerializer<String> {
     override val descriptor = PrimitiveSerialDescriptor("FlexibleString", PrimitiveKind.STRING)

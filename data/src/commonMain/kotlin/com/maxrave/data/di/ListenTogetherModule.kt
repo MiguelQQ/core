@@ -1,18 +1,12 @@
 package com.maxrave.data.di
 
-import com.maxrave.common.AppIdentity
 import com.maxrave.common.Config
 import com.maxrave.data.listentogether.ListenTogetherPlaybackBridge
-import com.maxrave.data.listentogether.ListenTogetherPrefs
 import com.maxrave.data.listentogether.ListenTogetherRepositoryImpl
 import com.maxrave.domain.repository.ListenTogetherRepository
-import com.maxrave.domain.manager.DataStoreManager
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
-import org.simpmusic.listentogether.ListenTogetherClient
 import org.simpmusic.listentogether.ListenTogetherSession
 
 /**
@@ -25,17 +19,9 @@ import org.simpmusic.listentogether.ListenTogetherSession
 val listenTogetherModule =
     module {
         single {
-            ListenTogetherClient(
-                clientVersion = "SimpMusic",
-                userAgent = get<AppIdentity>().userAgent,
-                // Read per connection attempt, so a server changed in settings applies next time.
-                serverUrl = {
-                    runBlocking { get<DataStoreManager>().getString(ListenTogetherPrefs.SERVER_URL).first().orEmpty() }
-                },
-            )
+            val accounts = get<com.maxrave.domain.repository.KillmonAccountRepository>()
+            ListenTogetherSession(accessToken = { accounts.jamAccessToken() })
         }
-
-        single { ListenTogetherSession(client = get()) }
 
         // The boundary: everything above this line speaks domain types only.
         single<ListenTogetherRepository> {
@@ -52,6 +38,7 @@ val listenTogetherModule =
                 repository = get(),
                 session = get(),
                 handler = get(),
+                songs = get(),
                 scope = get<CoroutineScope>(named(Config.SERVICE_SCOPE)),
             ).also { it.start() }
         }

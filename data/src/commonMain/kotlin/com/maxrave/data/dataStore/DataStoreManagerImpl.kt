@@ -87,7 +87,11 @@ internal class DataStoreManagerImpl(
     override suspend fun setLocation(location: String) {
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
+                if (settings[LOCATION] != location) {
+                    clearRegionalCache(settings)
+                }
                 settings[LOCATION] = location
+                settings[CHART_KEY] = location
             }
         }
     }
@@ -196,6 +200,9 @@ internal class DataStoreManagerImpl(
         // promos block was saved from the main-thread service scope as playback started.
         withContext(Dispatchers.IO) {
             settingsDataStore.edit { settings ->
+                if (key == SELECTED_LANGUAGE && settings[stringPreferencesKey(key)] != value) {
+                    clearRegionalCache(settings)
+                }
                 settings[stringPreferencesKey(key)] = value
             }
         }
@@ -925,18 +932,10 @@ internal class DataStoreManagerImpl(
         }
     }
 
-    override val chartKey =
-        settingsDataStore.data.map { preferences ->
-            preferences[CHART_KEY] ?: "ZZ"
-        }
+    // Charts and Home share the same country selection.
+    override val chartKey = location
 
-    override suspend fun setChartKey(key: String) {
-        withContext(Dispatchers.IO) {
-            settingsDataStore.edit { settings ->
-                settings[CHART_KEY] = key
-            }
-        }
-    }
+    override suspend fun setChartKey(key: String) = setLocation(key)
 
     override val themeMode =
         settingsDataStore.data.map { preferences ->

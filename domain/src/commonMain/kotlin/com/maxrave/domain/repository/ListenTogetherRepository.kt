@@ -51,5 +51,10 @@ interface ListenTogetherRepository {
     /** Re-syncs a guest with the room after it has driven its own transport. */
     fun requestSync()
 
+    fun forcePlay() {}
+    fun removeTrack(qid: Long) {}
+    fun moveTrack(qid: Long, to: Int) {}
+    fun transport(type: String) {}
+
     fun clearError()
 }

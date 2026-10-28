@@ -17,6 +17,7 @@ import com.maxrave.domain.data.model.metadata.SimpMusicLyrics
 import com.maxrave.domain.extension.now
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.repository.LyricsCanvasRepository
+import com.maxrave.domain.utils.NO_RELIABLE_LYRICS_MATCH
 import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.connectArtists
 import com.maxrave.domain.utils.toListName
@@ -40,6 +41,7 @@ import kotlinx.coroutines.withContext
 import org.simpmusic.aiservice.AiClient
 import org.simpmusic.lyrics.SimpMusicLyricsApiException
 import org.simpmusic.lyrics.SimpMusicLyricsClient
+import org.simpmusic.lyrics.lyricsIdentityMatches
 import org.simpmusic.lyrics.am.AMAlbumResource
 import org.simpmusic.lyrics.am.AMArtwork
 import org.simpmusic.lyrics.am.AMEditorialVideo
@@ -391,6 +393,8 @@ internal class LyricsCanvasRepositoryImpl(
         dataStoreManager: DataStoreManager,
         query: String,
         duration: Int?,
+        title: String?,
+        artist: String?,
     ): Flow<Resource<Lyrics>> =
         flow {
             runCatching {
@@ -456,34 +460,26 @@ internal class LyricsCanvasRepositoryImpl(
                     spotify
                         .searchSpotifyTrack(q, authToken, spotifyClientToken)
                         .onSuccess { searchResponse ->
+                            // totalMilliseconds is milliseconds. [duration] is seconds. Comparing
+                            // them raw never matched, so the old code kept the first search hit.
                             val track =
-                                if (duration != 0 && duration != null) {
-                                    searchResponse.data?.searchV2?.tracksV2?.items?.find {
-                                        abs(
-                                            (
-                                                (
-                                                    (
-                                                        it.item
-                                                            ?.data
-                                                            ?.duration
-                                                            ?.totalMilliseconds ?: (0 / 1000)
-                                                    ) - duration
-                                                )
-                                            ),
-                                        ) < 1
+                                searchResponse.data?.searchV2?.tracksV2?.items
+                                    ?.filter { item ->
+                                        val data = item.item?.data
+                                        val artistName =
+                                            data?.artists?.items?.mapNotNull { it.profile?.name }?.joinToString(", ")
+                                        lyricsIdentityMatches(
+                                            expectedTitle = title ?: query,
+                                            expectedArtist = artist.orEmpty(),
+                                            expectedDurationSeconds = duration,
+                                            candidateTitle = data?.name,
+                                            candidateArtist = artistName,
+                                            candidateDurationSeconds = data?.duration?.totalMilliseconds?.div(1000),
+                                        )
+                                    }?.minByOrNull { item ->
+                                        val seconds = item.item?.data?.duration?.totalMilliseconds?.div(1000) ?: 0
+                                        abs(seconds - (duration ?: 0))
                                     }
-                                        ?: searchResponse.data
-                                            ?.searchV2
-                                            ?.tracksV2
-                                            ?.items
-                                            ?.firstOrNull()
-                                } else {
-                                    searchResponse.data
-                                        ?.searchV2
-                                        ?.tracksV2
-                                        ?.items
-                                        ?.firstOrNull()
-                                }
                             Logger.d("Lyrics", "track: $track")
                             if (track != null) {
                                 spotify
@@ -501,6 +497,8 @@ internal class LyricsCanvasRepositoryImpl(
                             throwable.printStackTrace()
                             emit(Resource.Error<Lyrics>("Not found"))
                         }
+                } else {
+                    emit(Resource.Error<Lyrics>("Not found"))
                 }
             }
         }
@@ -537,7 +535,11 @@ internal class LyricsCanvasRepositoryImpl(
             simpMusicLyrics
                 .searchLrclibLyrics(qtrack, qartist, duration)
                 .onSuccess {
-                    it?.let { emit(Resource.Success<Lyrics>(it.toLyrics())) }
+                    if (it == null) {
+                        emit(Resource.Error<Lyrics>(NO_RELIABLE_LYRICS_MATCH))
+                    } else {
+                        emit(Resource.Success<Lyrics>(it.toLyrics()))
+                    }
                 }.onFailure {
                     it.printStackTrace()
                     emit(Resource.Error<Lyrics>("Not found"))
@@ -576,8 +578,8 @@ internal class LyricsCanvasRepositoryImpl(
             simpMusicLyrics
                 .searchBetterLyrics(qtrack, qartist, duration)
                 .onSuccess { ttml ->
-                    if (ttml.isNullOrEmpty()) {
-                        emit(Resource.Error<Lyrics>("No BetterLyrics found"))
+                    if (ttml.isNullOrEmpty() || !ttmlMatchesTrack(ttml, qtrack, qartist, duration)) {
+                        emit(Resource.Error<Lyrics>(NO_RELIABLE_LYRICS_MATCH))
                         return@onSuccess
                     }
                     val lyrics = parseTtmlLyrics(ttml).toLyrics()
@@ -699,16 +701,35 @@ internal class LyricsCanvasRepositoryImpl(
         }
     }
 
-    override fun getSimpMusicLyrics(videoId: String): Flow<Resource<Lyrics>> =
+    override fun getSimpMusicLyrics(
+        videoId: String,
+        title: String?,
+        artist: String?,
+        durationSeconds: Int?,
+    ): Flow<Resource<Lyrics>> =
         flow {
             simpMusicLyrics
                 .getLyrics(videoId)
                 .onSuccess { lyrics ->
                     Logger.d(simpMusicLyricsTag, "Lyrics found: $lyrics")
-                    val result = lyrics.firstOrNull()
+                    // Same video id, and the uploaded title, artist and length have to be this track.
+                    // The first row can be a different song someone attached to the id.
+                    val result =
+                        lyrics
+                            .filter { it.videoId == videoId }
+                            .filter {
+                                lyricsIdentityMatches(
+                                    expectedTitle = title.orEmpty(),
+                                    expectedArtist = artist.orEmpty(),
+                                    expectedDurationSeconds = durationSeconds,
+                                    candidateTitle = it.songTitle,
+                                    candidateArtist = it.artistName,
+                                    candidateDurationSeconds = it.durationSeconds,
+                                )
+                            }.minByOrNull { abs(it.durationSeconds - (durationSeconds ?: 0)) }
                     if (result == null) {
-                        Logger.w(simpMusicLyricsTag, "No lyrics found for videoId: $videoId")
-                        emit(Resource.Error<Lyrics>("No lyrics found"))
+                        Logger.w(simpMusicLyricsTag, "No reliable lyrics for videoId: $videoId")
+                        emit(Resource.Error<Lyrics>(NO_RELIABLE_LYRICS_MATCH))
                         return@onSuccess
                     }
                     val appLyrics =
@@ -1110,3 +1131,39 @@ private fun AMAlbumResource.hasAnimatedArtwork(): Boolean =
 private fun AMEditorialVideo.preferredRendition(): AMMotionVideo? =
     listOfNotNull(motionDetailTall, motionTallVideo3x4, motionDetailSquare, motionSquareVideo1x1)
         .firstOrNull { it.video != null }
+
+private val ttmlMetaTag =
+    Regex("""<(?:\w+:)?(title|artist|songtitle|artistname)\b[^>]*>([^<]+)</""", RegexOption.IGNORE_CASE)
+
+private val ttmlDurationValue = Regex("""\b(?:duration|songDuration)[^0-9]{0,12}(\d+)""", RegexOption.IGNORE_CASE)
+
+/**
+ * BetterLyrics returns a TTML body and no track id. Accept it only when the file itself names
+ * this title, this artist and a length within [org.simpmusic.lyrics.LYRICS_DURATION_TOLERANCE_SECONDS].
+ */
+private fun ttmlMatchesTrack(
+    ttml: String,
+    title: String,
+    artist: String,
+    durationSeconds: Int?,
+): Boolean {
+    val tags =
+        ttmlMetaTag.findAll(ttml).map { it.groupValues[1].lowercase() to it.groupValues[2].trim() }.toList()
+    val metaTitle = tags.firstOrNull { it.first == "title" || it.first == "songtitle" }?.second
+    val metaArtist = tags.firstOrNull { it.first == "artist" || it.first == "artistname" }?.second
+    val rawDuration = ttmlDurationValue.find(ttml)?.groupValues?.get(1)?.toIntOrNull()
+    val metaDuration =
+        when {
+            rawDuration == null -> null
+            rawDuration > 10_000 -> rawDuration / 1000
+            else -> rawDuration
+        }
+    return lyricsIdentityMatches(
+        expectedTitle = title,
+        expectedArtist = artist,
+        expectedDurationSeconds = durationSeconds,
+        candidateTitle = metaTitle,
+        candidateArtist = metaArtist,
+        candidateDurationSeconds = metaDuration,
+    )
+}

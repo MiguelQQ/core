@@ -47,6 +47,20 @@ interface MediaPlayerInterface {
     // Media item management
     fun setMediaItem(mediaItem: GenericMediaItem)
 
+    /**
+     * Replaces the queue with [mediaItem] and loads it ALREADY at [startPositionMs], paused: one load
+     * instead of set + prepare + seek. The seek of the three-call form is queued behind a load that
+     * has already started at 0, which is how a Listen Together joiner heard the intro again.
+     * The default is the three-call form for adapters that have no better way.
+     */
+    fun setMediaItem(
+        mediaItem: GenericMediaItem,
+        startPositionMs: Long,
+    ) {
+        setMediaItem(mediaItem)
+        if (startPositionMs > 0L) seekTo(startPositionMs)
+    }
+
     fun addMediaItem(mediaItem: GenericMediaItem)
 
     fun addMediaItem(
@@ -157,6 +171,16 @@ interface MediaPlayerInterface {
      * DataStore instead would lose the user's real preference if the process died mid-room.
      */
     var crossfadeSuppressed: Boolean
+
+    /**
+     * True from the moment another app (a YouTube video, a call) took audio focus until playback is
+     * asked for again or focus comes back. A Listen Together room must not overrule it: the pause is
+     * this phone's, not the room's, and re-forcing play would steal focus straight back.
+     * Setting it false is the user's "play" arriving through the room.
+     */
+    var audioFocusLost: Boolean
+        get() = false
+        set(_) {}
 
     /**
      * `mediaId`s of the tracks that came from the album currently loaded in the queue, or empty

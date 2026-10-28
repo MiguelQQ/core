@@ -1,574 +1,327 @@
 package com.maxrave.data.listentogether
 
 import com.maxrave.common.MERGING_DATA_TYPE
-import com.maxrave.domain.data.model.browse.album.Track
-import com.maxrave.domain.data.model.listentogether.RoomTrack
+import com.maxrave.domain.data.player.JamPlaybackRouter
+import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
+import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.searchResult.songs.Artist
+import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
+import com.maxrave.domain.mediaservice.handler.PlaylistType
 import com.maxrave.domain.mediaservice.handler.QueueData
-import com.maxrave.domain.mediaservice.handler.SimpleMediaState
+import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.ListenTogetherRepository
-import com.maxrave.logger.Logger
-import kotlin.math.abs
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.*
+import kotlinx.serialization.json.put
 import kotlin.time.TimeSource
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import org.simpmusic.listentogether.ListenTogetherSession
-import org.simpmusic.listentogether.PlaybackActions
-import org.simpmusic.listentogether.TrackInfo
+import org.simpmusic.listentogether.*
 
-private const val PLAY_SETTLE_TIMEOUT_MS = 2_000L
-
-/** Poll step for the settle wait; playWhenReady has no flow to collect. */
-private const val PLAY_SETTLE_POLL_MS = 50L
-private const val TAG = "ListenTogetherBridge"
-
-/** What the guest reacts to. A data class so `distinctUntilChanged` compares every field. */
-private data class RoomSnapshot(
-    val track: RoomTrack?,
-    val isPlaying: Boolean,
-    val position: Long,
-    val queueIds: List<String>,
-)
-
-/**
- * Joins a Listen Together room to the local player.
- *
- * Lives in `commonMain` and talks only to [MediaPlayerHandler], which is the one interface both
- * platforms implement — Android's `MediaServiceHandlerImpl` and Desktop's
- * `JvmMediaPlayerHandlerImpl` share nothing else, so anything written against a concrete player
- * would have to be written twice and would drift.
- *
- * Direction of travel is decided entirely by who hosts:
- * - **Host** watches the local player and publishes what it does.
- * - **Guest** watches the room and applies what the host did, and publishes nothing.
- *
- * The [applyingRemote] guard is what stops those two from feeding each other: applying a remote
- * pause makes the local player report "paused", which would otherwise be published straight back
- * to the server as a fresh command.
- */
+/** Reuses the inherited player bridge, with local YouTube resolution and the same barrier for host and guests. */
 class ListenTogetherPlaybackBridge(
-    /**
-     * Read through the repository (domain types), written through the session (protocol types).
-     *
-     * The split is deliberate: reacting to a room is app logic and belongs on our own model, while
-     * publishing a command is protocol detail that must not leak upward — putting
-     * `sendPlaybackAction` on the domain interface would drag Metrolist's schema into domain.
-     */
     private val repository: ListenTogetherRepository,
     private val session: ListenTogetherSession,
     private val handler: MediaPlayerHandler,
     private val scope: CoroutineScope,
+    private val songs: com.maxrave.domain.repository.SongRepository,
 ) {
     private var started = false
-    private var applyingRemote = false
-    private var lastPublishedTrackId: String? = null
-    private var lastAppliedTrackId: String? = null
-    private var lastAppliedQueueIds: List<String> = emptyList()
+    private var loadedSeq = -1L
+    private var readySeq = -1L
+    private var endedSeq = -1L
+    private var lastClock = 0L
+    private var bufferingSeq = -1L
+    private var savedParameters = com.maxrave.domain.data.player.GenericPlaybackParameters()
+    private var savedSkipSilence = false
+    private var savedShuffle = false
+    private var savedRepeat = 0
+    private var lastRoomCode: String? = null
+    private var lastRevisionTime = 0L
+    private val epoch = TimeSource.Monotonic.markNow()
+    private fun mono() = epoch.elapsedNow().inWholeMilliseconds
+    /** When WE last moved the playhead. A seek rebuffers, and that rebuffer must not open a room-wide gate. */
+    private var lastSeekAt = Long.MIN_VALUE / 2
+    /** The recording we asked the adapter to load, until the adapter (which applies it later) shows it. */
+    private var pendingLoad: Pair<String, Long>? = null
 
-    /**
-     * Whether the room was playing before the command currently being applied.
-     *
-     * Needed because change_track always says "not playing" — see [watchRoomForGuests].
-     */
-    private var lastRoomPlaying = false
+    // This listener only OBSERVES. Transport leaves the phone through JamPlaybackRouter, which every
+    // user path already goes through (scrubber, play/pause, next/prev, notification, headset).
+    // It used to also turn onIsPlayingChanged / onSeeked into room commands, guarded by an `applying`
+    // flag set around our own calls. The adapter applies those calls later, in its own coroutine, so
+    // the player's echo of OUR pause/seek/play arrived after the flag was down and was sent to the
+    // server as if a person had done it: a "pause" during the load gate left the room paused, a "play"
+    // overwrote the room clock with this phone's stale second, a "seek" opened another gate. That echo
+    // loop is the pause / resume-from-the-start / "loading" cycle seen on two phones.
+    private val listener = object : MediaPlayerListener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            val room = session.state.value
+            // Only a phone that was already in step with this generation can stall the room; one still
+            // catching up is not a reason to stop everybody else again.
+            if (room.inRoom && !room.loading && loadedSeq == room.seq && readySeq == room.seq && bufferingSeq != room.seq &&
+                JamSync.isRealStall(playbackState, mono(), lastSeekAt)) {
+                bufferingSeq = room.seq
+                session.command("buffering") { put("seq", room.seq); put("position", handler.player.currentPosition / 1000.0) }
+            }
+            reportReady()
+        }
+        override fun onPlayerError(error: PlayerError) {
+            val room = session.state.value
+            if (room.inRoom && handler.player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO) == room.currentTrack?.id) {
+                readySeq = -1L
+                session.markPlaybackFailed()
+            }
+        }
+    }
 
-    /** Idempotent: callers cannot know whether something else already started it. */
+    private class Outgoing(val item: GenericMediaItem, val play: Boolean)
+    private val outbox = Channel<Outgoing>(Channel.UNLIMITED)
+    private var chainAnchor: String? = null
+    private var chainUntil = 0L
+
+    /** Same title, artist and length the normal player would use: whatever the item lacks, the library has. */
+    private suspend fun outgoing(o: Outgoing) {
+        val item = o.item
+        val id = item.mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
+        var title = item.metadata.title.orEmpty()
+        var artist = item.metadata.artist.orEmpty().takeUnless { it.isBlank() || it == "null" }.orEmpty()
+        var duration = 0L
+        val known = withTimeoutOrNull(2_000) { songs.getSongById(id).firstOrNull() }
+        if (known != null) {
+            if (title.isBlank() || title == "null") title = known.title
+            if (artist.isBlank()) artist = known.artistName.orEmpty().joinToString(", ")
+            duration = (known.durationSeconds ?: 0) * 1000L
+        }
+        val info = TrackInfo(id = id, title = title, artist = artist, duration = duration, thumbnail = item.metadata.artworkUri.orEmpty())
+        val isVideo = item.metadata.description == MERGING_DATA_TYPE.VIDEO
+        val now = mono()
+        // A playlist is a play followed by its other tracks: those go right behind the first one,
+        // not behind whatever the room's automatic mix had queued.
+        val after = if (!o.play && now < chainUntil) chainAnchor else null
+        if (o.play || after != null) { chainAnchor = id; chainUntil = now + 1_500 }
+        session.suggestTrack(info, play = o.play, isVideo = isVideo, after = after)
+    }
+
+    private val actions = object : JamPlaybackRouter.Actions {
+        override fun add(item: GenericMediaItem) { outbox.trySend(Outgoing(item, false)) }
+        override fun play(item: GenericMediaItem) { outbox.trySend(Outgoing(item, true)) }
+        override fun queue(type: String, index: Int, to: Int?) {
+            val room = session.state.value
+            val qid = room.queueIds.getOrNull(index) ?: return
+            session.command(type) { put("qid", qid); to?.let { put("to", it) } }
+        }
+        override fun control(type: String, positionMs: Long?) {
+            // Asking for play is the user answering the pause another app caused.
+            if (type == "play") handler.player.audioFocusLost = false
+            session.command(type) { positionMs?.let { put("position", it.coerceAtLeast(0L) / 1000.0) } }
+        }
+    }
+
+    private fun mediaItemFor(track: TrackInfo, isVideo: Boolean) = GenericMediaItem(
+        mediaId = track.id, uri = "https://music.youtube.com/watch?v=${track.id}",
+        metadata = GenericMediaMetadata(
+            title = track.title, artist = track.artist,
+            artworkUri = track.thumbnail.ifBlank { "https://i.ytimg.com/vi/${track.id}/hqdefault.jpg" },
+            // Video rooms tracks keep their type, so MergingMediaSourceFactory resolves the video
+            // stream exactly as it does outside a room (and still honours the watch-video setting).
+            description = if (isVideo) MERGING_DATA_TYPE.VIDEO else MERGING_DATA_TYPE.SONG,
+        ),
+        customCacheKey = track.id,
+    )
+
+    private fun mirrorOf(room: ListenTogetherState): QueueData.Data = QueueData.Data(
+        listTracks = room.queue.mapIndexed { i, info ->
+            val video = room.queueIsVideo.getOrNull(i) == true
+            val url = info.thumbnail.ifBlank { "https://i.ytimg.com/vi/${info.id}/hqdefault.jpg" }
+            Track(
+                album = null,
+                artists = info.artist.split(", ").filter { it.isNotBlank() }.map { Artist(id = null, name = it) },
+                duration = null,
+                durationSeconds = (info.duration / 1000).toInt().takeIf { it > 0 },
+                isAvailable = true, isExplicit = false, likeStatus = null,
+                thumbnails = listOf(if (video) Thumbnail(720, url, 1280) else Thumbnail(544, url, 544)),
+                title = info.title, videoId = info.id, videoType = null, category = null, feedbackTokens = null, resultType = null,
+            )
+        },
+        playlistId = null, playlistName = "JAM ${room.roomCode.orEmpty()}", playlistType = PlaylistType.PLAYLIST,
+    )
+
+    private fun seekLocal(positionMs: Long) {
+        lastSeekAt = mono()
+        handler.player.seekTo(positionMs)
+    }
+
+    // Called on Main, both by the player event and the polling fallback.
+    private fun reportReady() {
+        val room = session.state.value
+        if (room.connection is ConnectionState.Connected && loadedSeq == room.seq &&
+            JamSync.sameTrack(handler.player.currentMediaItem?.mediaId, room.currentTrack?.id.orEmpty()) &&
+            readySeq != room.seq && JamSync.ready(handler.player.playbackState)) {
+            readySeq = room.seq
+            session.reportBufferReady(room.currentTrack?.id.orEmpty(), room.seq)
+            session.clearPlaybackFailed()
+            // Ready while the room is already running (a late joiner): land on its second once.
+            if (!room.loading) {
+                val target = session.positionAt(room.position, room.isPlaying)
+                if (JamSync.needsSeek(handler.player.currentPosition, target, JamSync.GATE_TOLERANCE_MS)) seekLocal(target)
+            }
+        }
+    }
+
     fun start() {
         if (started) return
         started = true
-        Logger.i(TAG, "Playback bridge started")
-        scope.launch { suppressCrossfadeWhileInRoom() }
-        scope.launch { watchRoomForGuests() }
-        scope.launch { resyncGuestOnResume() }
-        scope.launch { publishCurrentStateOnJoin() }
-        scope.launch { publishStateWhenSomeoneArrives() }
-        scope.launch { publishQueueAsHost() }
-        scope.launch { publishTrackChangesAsHost() }
-        scope.launch { publishPlayPauseAsHost() }
-        scope.launch { publishSeeksAsHost() }
-        scope.launch { answerBufferBarrier() }
-    }
-
-    /**
-     * Crossfade overlaps two tracks for seconds, which drifts a room apart at every transition.
-     *
-     * The user's own setting is left alone — this is a separate override on the player, the same
-     * shape as the sleep-timer fade, so a process death mid-room cannot lose their preference.
-     */
-    private suspend fun suppressCrossfadeWhileInRoom() {
-        repository.room
-            .map { it.inRoom }
-            .distinctUntilChanged()
-            .collect { inRoom ->
-                withContext(Dispatchers.Main) { handler.player.crossfadeSuppressed = inRoom }
-                if (!inRoom) {
-                    lastRoomPlaying = false
-                } else if (!repository.room.value.isHost) {
-                    // Ask for the live position the moment we are in. The state pushed on join
-                    // carries the position as of the host's LAST command, which can be minutes old
-                    // — obeying it drops a joiner at the start of a song everyone else is halfway
-                    // through. sync_state answers with where the room actually is.
-                    repository.requestSync()
+        scope.launch(Dispatchers.Main) { handler.player.addListener(listener) }
+        scope.launch { for (o in outbox) { try { outgoing(o) } catch (e: CancellationException) { throw e } catch (_: Exception) { session.playbackError("No se pudo añadir la canción a la JAM") } } }
+        // The room's queue is shown by the normal queue screen: it reads the handler's queue, and the
+        // handler already routes tap / drag / remove back to the room through JamPlaybackRouter.
+        scope.launch(Dispatchers.Main) {
+            var mirrored = false
+            session.state.map { Triple(it.roomCode, it.queueIds, it.queue.map { t -> t.id + t.title + t.artist + t.thumbnail }) to it.queueIsVideo }
+                .distinctUntilChanged().collect {
+                    val room = session.state.value
+                    if (room.inRoom) { mirrored = true; handler.setQueueData(mirrorOf(room)) }
+                    else if (mirrored) { mirrored = false; handler.setQueueData(QueueData.Data()) }
                 }
-                Logger.i(TAG, if (inRoom) "Crossfade suppressed for the room" else "Crossfade restored")
-            }
-    }
-
-    /**
-     * A guest may pause, and stays paused.
-     *
-     * An earlier version forced the guest straight back to the room's state, which made pause
-     * impossible — press it and playback resumed instantly. The room is something you listen along
-     * with, not something that holds your transport hostage: pausing is local and silent, and
-     * pressing play again asks the server where the room actually is now, so resuming lands in the
-     * right place instead of wherever this device stopped. This is what Metrolist's manager does
-     * (`requestSync` — "call this when a guest presses play/pause").
-     */
-    private suspend fun resyncGuestOnResume() {
-        handler.controlState
-            .map { it.isPlaying }
-            .distinctUntilChanged()
-            .collect { locallyPlaying ->
-                val room = repository.room.value
-                if (!room.inRoom || room.isHost || applyingRemote) return@collect
-                if (!locallyPlaying) {
-                    Logger.i(TAG, "Guest paused locally — leaving the room running")
-                    return@collect
-                }
-                Logger.i(TAG, "Guest resumed — asking the server where the room is")
-                repository.requestSync()
-            }
-    }
-
-    // ─────────────────────────── guest: follow the host ───────────────────────────
-
-    private suspend fun watchRoomForGuests() {
-        repository.room
-            // The queue is part of the key: without it a room state that changed ONLY its queue
-            // compares equal here and is dropped, so the guest never builds the host's queue at all.
-            .map {
-                RoomSnapshot(
-                    track = it.currentTrack,
-                    isPlaying = it.isPlaying,
-                    position = it.position,
-                    queueIds = it.queue.map { t -> t.id },
-                ) to (it.inRoom && !it.isHost)
-            }
-            .distinctUntilChanged()
-            .collect { (snapshot, shouldFollow) ->
-                if (!shouldFollow) return@collect
-                val (track, isPlaying, position, queueIds) = snapshot
-                Logger.i(TAG, "Room says: track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
-                applyingRemote = true
-                try {
-                    // Rebuild when the track changes OR when the queue behind it does — the queue
-                    // can legitimately arrive while the same track keeps playing.
-                    val queueChanged = queueIds != lastAppliedQueueIds
-                    val trackChanged =
-                        track != null && track.id.isNotBlank() && (track.id != lastAppliedTrackId || queueChanged)
-                    // The server forces IsPlaying=false on EVERY change_track — protocol default,
-                    // not the host pausing. Obeying it pauses the track just loaded, which is why
-                    // the guest sat silent on next, prev AND end-of-song alike. Carry the room's
-                    // previous intent across the change; a real pause arrives as its own command,
-                    // with the track unchanged, and is applied normally.
-                    val playing = if (trackChanged && !isPlaying) lastRoomPlaying else isPlaying
-                    lastRoomPlaying = playing
-                    if (trackChanged && track != null) {
-                        val sameTrack = track.id == lastAppliedTrackId
-                        lastAppliedTrackId = track.id
-                        lastAppliedQueueIds = queueIds
-                        // Decided BEFORE loading, not corrected afterwards: loading with a hardcoded
-                        // playWhenReady=true and letting applyTransport pause it is a race, and the
-                        // guest wins it by starting to play in a room the host has paused.
-                        // A NEW track still starts where the room is, not at zero: someone joining
-                        // a room mid-song must land next to everyone else. Only the same track
-                        // being rebuilt (the queue arrived late) keeps the local playhead.
-                        val startAt =
-                            when {
-                                sameTrack -> handler.player.currentPosition
-                                // change_track carries position 0, and 0 means "from the top" —
-                                // running it through the clock correction turns it into however
-                                // long ago the last command was, which can seek past the end.
-                                position <= 0L -> 0L
-                                else -> session.positionAt(position, playing)
-                            }
-                        playTrack(track, keepPosition = startAt, playWhenReady = playing)
+        }
+        scope.launch(Dispatchers.Main) {
+            session.state.map { Triple(it.roomCode, it.seq, it.connection is ConnectionState.Connected) to it.selfUserId }.distinctUntilChanged().collectLatest { (key, selfId) ->
+                val (code, seq, connected) = key
+                if (code != null && selfId.isBlank()) return@collectLatest
+                JamPlaybackRouter.actions = if (code == null) null else actions
+                if (code == null) {
+                    handler.player.crossfadeSuppressed = false
+                    if (lastRoomCode != null) {
+                        handler.player.pause(); handler.player.clearMediaItems()
+                        handler.player.playbackParameters = savedParameters
+                        handler.player.skipSilenceEnabled = savedSkipSilence
+                        handler.player.shuffleModeEnabled = savedShuffle; handler.player.repeatMode = savedRepeat
                     }
-                    applyTransport(playing, position)
-                } catch (e: Exception) {
-                    Logger.e(TAG, "Failed to apply remote state: ${e.message}")
-                } finally {
-                    applyingRemote = false
+                    lastRoomCode = null; loadedSeq = -1; readySeq = -1; pendingLoad = null; chainAnchor = null
+                    return@collectLatest
                 }
-            }
-    }
-
-    private suspend fun applyTransport(
-        isPlaying: Boolean,
-        position: Long,
-    ) = withContext(Dispatchers.Main) {
-        // Correct the position for however long the command spent in flight; ServerClock falls back
-        // to the raw value whenever it is not calibrated yet.
-        val corrected = session.positionAt(position, isPlaying)
-        // A small drift is normal and seeking on every tick would stutter; only a real gap is worth
-        // a seek, which is also why the host publishes position with each command.
-        if (abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
-            handler.player.seekTo(corrected)
-        }
-        // playWhenReady, not isPlaying: a track that is still buffering reports isPlaying=false
-        // while already committed to playing, so comparing against it re-issues play() every tick
-        // and, worse, lets a stale pause land on a track that was about to start.
-        if (isPlaying && !handler.player.playWhenReady) {
-            handler.player.play()
-        } else if (!isPlaying && handler.player.playWhenReady) {
-            handler.player.pause()
-        }
-    }
-
-    /**
-     * Loads the host's track locally.
-     *
-     * The room only carries a videoId, so the guest resolves its own metadata and stream — which is
-     * exactly why two clients on different platforms, or a SimpMusic and a Metrolist client, can
-     * share a room at all: both read the same catalogue rather than shipping audio to each other.
-     */
-    /**
-     * Loads the host's track and queue.
-     *
-     * Built straight from the room's own [TrackInfo], the way Metrolist's manager does
-     * (`TrackInfo.toMediaMetadata().toMediaItem()`) — deliberately NOT by resolving metadata from
-     * the catalogue first. Two reasons, both learned the hard way:
-     *
-     * 1. `Track.toGenericMediaItem()` GUESSES song-vs-video from the artwork aspect ratio and
-     *    treats the `maxresdefault.jpg` fallback as video. A guest resolving its own metadata lands
-     *    on that branch almost every time, ends up on the merged audio+video path, and gets video
-     *    with no sound where the host has plain audio.
-     * 2. A network round trip per track can hang; `first { it.data != null }` on a flow that never
-     *    carries data blocks the whole collector, and with it every later room command.
-     *
-     * The stream itself is still resolved locally by the player — the room only ever carries ids.
-     */
-    private suspend fun playTrack(
-        info: RoomTrack,
-        keepPosition: Long = 0L,
-        playWhenReady: Boolean,
-    ) {
-        val roomQueue = repository.room.value.queue
-        // Metrolist's canonicalPlaybackQueue: the current track leads, upcoming follows, no dupes.
-        val ordered =
-            (listOf(info) + roomQueue.filter { it.id != info.id })
-                .filter { it.id.isNotBlank() }
-                .distinctBy { it.id }
-        Logger.i(TAG, "Guest loading ${info.id} (${info.title}) + ${ordered.size - 1} upcoming")
-
-        // Dispatchers.Main is mandatory, not tidiness: Media3 throws if the player is touched off
-        // the main thread, and the bridge runs on the service scope (Default).
-        withContext(Dispatchers.Main) {
-            handler.clearMediaItems()
-            handler.addMediaItem(ordered.first().toRoomMediaItem(), playWhenReady = playWhenReady)
-            val rest = ordered.drop(1)
-            if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
-            // Rebuilding restarts the track; if only the queue changed, put the playhead back.
-            if (keepPosition > 0L) handler.player.seekTo(keepPosition)
-        }
-    }
-
-    /**
-     * A room track as a media item.
-     *
-     * `MERGING_DATA_TYPE.SONG` is set explicitly: inside a room every client must be on the same
-     * rendition, and for listening together that rendition is audio. Leaving it to be inferred is
-     * what produced video-with-no-sound on the guest.
-     */
-    private fun RoomTrack.toRoomMediaItem(): GenericMediaItem =
-        GenericMediaItem(
-            mediaId = id,
-            uri = id,
-            metadata =
-                GenericMediaMetadata(
-                    title = title,
-                    artist = artist.ifBlank { null },
-                    albumTitle = album.ifBlank { null },
-                    artworkUri = thumbnail.ifBlank { null },
-                    description = MERGING_DATA_TYPE.SONG,
-                ),
-            customCacheKey = id,
-        )
-
-    // ─────────────────────────── host: publish what we do ───────────────────────────
-
-    /**
-     * Publishes what is ALREADY playing the moment we become host.
-     *
-     * Everything else here reacts to a *change* — a track transition, a play/pause. Someone who
-     * was already listening and then opens a room produces neither, so without this the room has
-     * no state at all and every guest sits in silence waiting for a command that only arrives if
-     * the host happens to touch the transport.
-     */
-    private suspend fun publishCurrentStateOnJoin() {
-        repository.room
-            .map { it.inRoom && it.isHost }
-            .distinctUntilChanged()
-            .collect { isHosting -> if (isHosting) publishSnapshot() }
-    }
-
-    /**
-     * Re-publishes for a guest who arrives later.
-     *
-     * The server keeps the room's last known state, but only what the host has told it; a guest
-     * approved before the host's first command would otherwise join an empty room.
-     */
-    private suspend fun publishStateWhenSomeoneArrives() {
-        repository.room
-            .map { it.members.size }
-            .distinctUntilChanged()
-            .collect { count ->
-                val state = repository.room.value
-                if (state.inRoom && state.isHost && count > 1) publishSnapshot()
-            }
-    }
-
-    /** Republishes the queue whenever the host's own queue changes. */
-    private suspend fun publishQueueAsHost() {
-        handler.queueData
-            .map { (it as? QueueData.Data)?.listTracks?.map { t -> t.videoId }.orEmpty() }
-            .distinctUntilChanged()
-            .collect { ids ->
-                val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote || ids.isEmpty()) return@collect
-                publishQueue()
-            }
-    }
-
-    private fun publishQueue() {
-        val data = handler.queueData.value as? QueueData.Data ?: return
-        val tracks = data.listTracks.map { it.toTrackInfo() }
-        if (tracks.isEmpty()) return
-        session.sendQueue(tracks, data.playlistName.orEmpty())
-        Logger.i(TAG, "Published queue of ${tracks.size} track(s)")
-    }
-
-    private fun publishSnapshot() {
-        val item = handler.nowPlaying.value ?: return
-        if (item.mediaId.isBlank()) return
-        lastPublishedTrackId = item.mediaId
-        val data = handler.queueData.value as? QueueData.Data
-        session.sendPlaybackAction(
-            action = PlaybackActions.CHANGE_TRACK,
-            trackId = item.mediaId,
-            position = handler.player.currentPosition,
-            trackInfo = item.toTrackInfo(),
-            queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
-            queueTitle = data?.playlistName.orEmpty(),
-        )
-        // A second command, because change_track alone does not say whether it is running —
-        // the server explicitly sets IsPlaying=false on a track change.
-        session.sendPlaybackAction(
-            action = if (handler.player.playWhenReady) PlaybackActions.PLAY else PlaybackActions.PAUSE,
-            trackId = "",
-            position = handler.player.currentPosition,
-            trackInfo = null,
-        )
-        Logger.i(TAG, "Published current state to the room: ${item.mediaId}")
-    }
-
-    private suspend fun publishTrackChangesAsHost() {
-        handler.nowPlaying
-            .filterNotNull()
-            .distinctUntilChanged { old, new -> old.mediaId == new.mediaId }
-            .collect { item ->
-                val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote) return@collect
-                if (item.mediaId == lastPublishedTrackId) return@collect
-                lastPublishedTrackId = item.mediaId
-                Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
-                val data = handler.queueData.value as? QueueData.Data
-                session.sendPlaybackAction(
-                    action = PlaybackActions.CHANGE_TRACK,
-                    trackId = item.mediaId,
-                    position = 0L,
-                    trackInfo = item.toTrackInfo(),
-                    queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
-                    queueTitle = data?.playlistName.orEmpty(),
-                )
-                // change_track alone leaves the room paused: the server sets IsPlaying=false on
-                // every track change. The host's own controlState does NOT change when one playing
-                // track follows another, so nothing else would ever send this and guests would load
-                // each new track and sit there stopped.
-                //
-                // Whether the host is actually going to play this, decided by WAITING rather than
-                // by sampling. Reading playWhenReady inline was wrong twice over: it is false while
-                // a next-track buffers, and false again for a moment while the player is rebuilt
-                // for a track the host picked from a list — so the PLAY that guests depend on was
-                // dropped on exactly the transitions it exists for. A host who is genuinely paused
-                // simply never satisfies this and the room stays paused.
-                val started =
-                    withTimeoutOrNull(PLAY_SETTLE_TIMEOUT_MS) {
-                        // playWhenReady, not isPlaying: the intent flips the moment the load path
-                        // commits, while audible playback waits for the stream URL to resolve —
-                        // which can take longer than any reasonable timeout. Waiting for audio here
-                        // is why picking a track still left guests paused. Polled, because
-                        // playWhenReady is a plain property with no flow behind it.
-                        while (!handler.player.playWhenReady && !handler.player.isPlaying) {
-                            delay(PLAY_SETTLE_POLL_MS)
+                if (!connected) {
+                    loadedSeq = -1; readySeq = -1
+                    handler.player.pause()
+                    return@collectLatest
+                }
+                if (lastRoomCode != code) {
+                    val wasEmpty = session.state.value.currentTrack == null
+                    savedParameters = handler.player.playbackParameters
+                    savedSkipSilence = handler.player.skipSilenceEnabled
+                    savedShuffle = handler.player.shuffleModeEnabled; savedRepeat = handler.player.repeatMode
+                    handler.player.crossfadeSuppressed = true
+                    val initialPosition = handler.player.currentPosition
+                    val current = handler.player.currentMediaItem
+                    handler.player.pause()
+                    lastRoomCode = code
+                    val bare = current?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO).orEmpty()
+                    if (wasEmpty && session.state.value.isHost && current != null && Regex("^[A-Za-z0-9_-]{11}$").matches(bare)) {
+                        session.command("queue_add") { put("track", kotlinx.serialization.json.buildJsonObject { put("videoId", bare); put("title", current.metadata.title.orEmpty()); put("artist", current.metadata.artist.orEmpty()); put("thumbnail", current.metadata.artworkUri.orEmpty()); if (current.metadata.description == MERGING_DATA_TYPE.VIDEO) put("isVideo", true) }); put("automatic", false); put("position", initialPosition / 1000.0) }
+                    }
+                }
+                val room = session.state.value
+                val track = room.currentTrack ?: run { handler.player.pause(); return@collectLatest }
+                try {
+                    // The listener holds its second and pauses; nothing below reloads a recording the
+                    // player already has. The whole generation change is: pause, then at most one load
+                    // (other recording) or one seek (same recording, more than a second off).
+                    handler.player.playWhenReady = false
+                    val target = session.positionAt(room.position, room.isPlaying)
+                    val isVideo = room.queueIsVideo.getOrNull(room.queue.indexOfFirst { it.id == track.id }) == true
+                    val player = handler.player
+                    val pending = pendingLoad
+                    val step = when {
+                        pending != null && pending.first == track.id && mono() - pending.second < 2_500 -> JamLoadStep.Keep
+                        // A failed player keeps its MediaItem in STATE_IDLE: that one needs a real reload.
+                        JamSync.sameTrack(player.currentMediaItem?.mediaId, track.id) && player.playbackState == 1 -> JamLoadStep.Load(target.coerceAtLeast(0L))
+                        else -> JamSync.planStep(player.currentMediaItem?.mediaId, track.id, player.currentPosition, target)
+                    }
+                    when (step) {
+                        is JamLoadStep.Load -> {
+                            pendingLoad = track.id to mono()
+                            lastSeekAt = mono()
+                            player.setMediaItem(mediaItemFor(track, isVideo), step.startMs)
                         }
-                    } != null
-                if (started) {
-                    session.sendPlaybackAction(
-                        action = PlaybackActions.PLAY,
-                        trackId = "",
-                        position = handler.player.currentPosition,
-                        trackInfo = null,
-                    )
-                }
+                        is JamLoadStep.Seek -> seekLocal(step.toMs)
+                        JamLoadStep.Keep -> Unit
+                    }
+                    player.shuffleModeEnabled = false; player.repeatMode = 0
+                    if (player.playbackParameters.speed != 1f || player.playbackParameters.pitch != 1f) player.playbackParameters = com.maxrave.domain.data.player.GenericPlaybackParameters(1f, 1f)
+                    loadedSeq = seq; readySeq = -1; endedSeq = -1
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) { session.markPlaybackFailed() }
             }
-    }
-
-    private suspend fun publishPlayPauseAsHost() {
-        handler.controlState
-            .map { it.isPlaying }
-            .distinctUntilChanged()
-            .collect { isPlaying ->
-                val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote) return@collect
-                // A host that merely buffers reports isPlaying=false, indistinguishable from a
-                // user pause — and publishing it stops the WHOLE room on one device's hiccup.
-                // playWhenReady carries the intent, so a dip where the two disagree is not news.
-                val intent = handler.player.playWhenReady
-                if (isPlaying != intent) return@collect
-                Logger.i(TAG, "Host publishing ${if (intent) "PLAY" else "PAUSE"}")
-                session.sendPlaybackAction(
-                    action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,
-                    // Deliberately EMPTY. The server rejects a play/pause whose trackId does not
-                    // match the track it is holding ("stale_track") and drops it silently; sending
-                    // nothing makes it fill in its own current track, which is always right.
-                    trackId = "",
-                    position = handler.player.currentPosition,
-                    trackInfo = null,
-                )
-            }
-    }
-
-    /**
-     * Publishes a seek.
-     *
-     * Neither `nowPlaying` nor `controlState` changes when the host drags the scrubber, so without
-     * this a seek is simply never sent and guests keep playing from wherever they were.
-     *
-     * Detected off `SimpleMediaState.Progress`, which both platforms already emit — Metrolist uses
-     * Media3's `onPositionDiscontinuity(DISCONTINUITY_REASON_SEEK)`, but that is an Android-only
-     * API and Desktop runs mpv. A seek is a position that moved further than wall-clock time could
-     * account for; ordinary playback advances roughly in step with it.
-     */
-    private suspend fun publishSeeksAsHost() {
-        var lastProgress = 0L
-        var lastAt = 0L
-        handler.simpleMediaState.collect { mediaState ->
-            val progress = (mediaState as? SimpleMediaState.Progress)?.progress ?: return@collect
-            val now = PROCESS_START.elapsedNow().inWholeMilliseconds
-            val previous = lastProgress
-            val previousAt = lastAt
-            lastProgress = progress
-            lastAt = now
-
-            val state = repository.room.value
-            if (!state.inRoom || !state.isHost || applyingRemote) return@collect
-            if (previousAt == 0L) return@collect
-
-            val elapsed = now - previousAt
-            val expected = previous + if (handler.player.isPlaying) elapsed else 0L
-            if (kotlin.math.abs(progress - expected) < SEEK_DETECT_MS) return@collect
-
-            Logger.i(TAG, "Host publishing SEEK to $progress (expected ~$expected)")
-            session.sendPlaybackAction(
-                action = PlaybackActions.SEEK,
-                trackId = "",
-                position = progress,
-                trackInfo = null,
-            )
         }
-    }
-
-    // ─────────────────────────── the buffer barrier ───────────────────────────
-
-    /**
-     * Answers `buffer_ready` once the local player has the track the room is waiting on.
-     *
-     * Nobody in the room hears anything until every member answers, so a client that never sends
-     * this silently freezes playback for everyone — including the host.
-     */
-    private suspend fun answerBufferBarrier() {
-        repository.room
-            .map { it.waitingFor to it.currentTrack?.id }
-            .distinctUntilChanged()
-            .collect { (waitingFor, trackId) ->
-                val state = repository.room.value
-                if (trackId.isNullOrBlank() || !state.inRoom) return@collect
-                if (state.selfUserId !in waitingFor) return@collect
-                // bufferedPercentage, not isPlaying: the barrier asks whether the track is loaded,
-                // and playback is exactly what it is holding back.
-                if (handler.player.bufferedPercentage >= READY_BUFFER_PERCENT) {
-                    session.reportBufferReady(trackId)
+        scope.launch {
+            var contributedRoom: String? = null
+            var lowSeq = -1L
+            var wasLow = false
+            session.state.collect { room ->
+                if (!room.inRoom) { contributedRoom = null; lowSeq = -1L; wasLow = false; return@collect }
+                if (!room.isConnected) return@collect
+                // Seed an existing host track before automatic contributions can start the room.
+                if (room.isHost && room.currentTrack == null && withContext(Dispatchers.Main) { handler.player.currentMediaItem != null }) return@collect
+                val index = room.queue.indexOfFirst { it.id == room.currentTrack?.id }
+                val low = room.queue.size - index - 1 < 3
+                val shouldContribute = contributedRoom != room.roomCode || (low && (!wasLow || lowSeq != room.seq))
+                wasLow = low
+                if (!shouldContribute) return@collect
+                contributedRoom = room.roomCode
+                lowSeq = room.seq
+                try {
+                    val own = (songs.getLikedSongs().first().shuffled().take(15) + songs.getAllSongs(100).first().shuffled())
+                        .distinctBy { it.videoId }.filter { song -> Regex("^[A-Za-z0-9_-]{11}$").matches(song.videoId) && room.queue.none { it.id == song.videoId } }.take(30)
+                    var candidates = own.map { TrackInfo(id = it.videoId, title = it.title, artist = it.artistName.orEmpty().joinToString(", "), thumbnail = it.thumbnails.orEmpty()) }
+                    if (candidates.isEmpty()) {
+                        val id = room.currentTrack?.id ?: withContext(Dispatchers.Main) { handler.player.currentMediaItem?.mediaId }
+                        if (id != null) candidates = withTimeoutOrNull(15_000) {
+                            songs.getRelatedData(id).first().data?.first.orEmpty().map {
+                                TrackInfo(id = it.videoId, title = it.title, artist = it.artists.orEmpty().joinToString(", ") { artist -> artist.name }, thumbnail = it.thumbnails?.lastOrNull()?.url.orEmpty())
+                            }
+                        }.orEmpty()
+                    }
+                    if (session.state.value.roomCode == room.roomCode) session.contribute(candidates)
+                } catch (e: CancellationException) { throw e }
+                catch (_: Exception) { session.playbackError("No se pudo renovar el aporte automático de este teléfono") }
+            }
+        }
+        scope.launch(Dispatchers.Main) {
+            while (isActive) {
+                delay(150)
+                val room = session.state.value
+                if (!room.inRoom || room.connection !is ConnectionState.Connected || loadedSeq != room.seq) continue
+                val player = handler.player
+                // Any external player navigation is stopped; the room has one server-selected item.
+                if (!JamSync.sameTrack(player.currentMediaItem?.mediaId, room.currentTrack?.id.orEmpty())) { if (pendingLoad?.first != room.currentTrack?.id) player.pause(); continue }
+                player.skipSilenceEnabled = false
+                if (player.playbackParameters.speed != 1f) player.playbackParameters = com.maxrave.domain.data.player.GenericPlaybackParameters()
+                val target = session.positionAt(room.position, room.isPlaying)
+                reportReady()
+                val state = player.playbackState
+                val inStep = readySeq == room.seq && !room.loading
+                // ENDED is never played again: play() on an ended player rewinds it to 0, which is the
+                // song starting over while the room waits for the host's `ended` to move on.
+                // A phone that lost audio focus (a YouTube video, a call) stays paused: that pause is
+                // this phone's, it is not sent to the room, and forcing play here would take the focus
+                // straight back from the app that asked for it.
+                val shouldPlay = inStep && room.isPlaying && state != JamSync.STATE_ENDED && !player.audioFocusLost
+                val now = mono()
+                if (inStep && JamSync.needsSeek(player.currentPosition, target) && JamSync.mayCorrectDrift(state, now, lastSeekAt) &&
+                    (!room.isHost || room.lastActionServerTime != lastRevisionTime)) seekLocal(target)
+                if (room.isHost) lastRevisionTime = room.lastActionServerTime
+                if (player.playWhenReady != shouldPlay && !(player.audioFocusLost && !shouldPlay)) player.playWhenReady = shouldPlay
+                if (room.isHost && inStep && room.isPlaying) {
+                    val serverNow = session.serverNow() ?: 0L
+                    if (state == JamSync.STATE_ENDED && endedSeq != room.seq) { endedSeq = room.seq; session.command("ended") { put("seq", room.seq) } }
+                    else if (shouldPlay && serverNow - lastClock >= 1000) {
+                        lastClock = serverNow
+                        session.command("pos") { put("seq", room.seq); put("position", player.currentPosition / 1000.0); put("t", serverNow) }
+                    }
                 }
             }
-    }
-
-    private fun RoomTrack.toProtocol(): TrackInfo =
-        TrackInfo(
-            id = id,
-            title = title,
-            artist = artist,
-            album = album,
-            duration = durationMs,
-            thumbnail = thumbnail,
-        )
-
-    private fun Track.toTrackInfo(): TrackInfo =
-        TrackInfo(
-            id = videoId,
-            title = title,
-            artist = artists?.joinToString(", ") { it.name }.orEmpty(),
-            album = album?.name.orEmpty(),
-            duration = (durationSeconds?.toLong() ?: 0L) * 1000L,
-            thumbnail = thumbnails?.lastOrNull()?.url.orEmpty(),
-        )
-
-    /** The room carries a videoId plus display metadata; the guest resolves its own stream. */
-    private fun GenericMediaItem.toTrackInfo(): TrackInfo =
-        TrackInfo(
-            id = mediaId,
-            title = metadata.title.orEmpty(),
-            artist = metadata.artist.orEmpty(),
-            album = metadata.albumTitle.orEmpty(),
-            duration = handler.player.duration.coerceAtLeast(0L),
-            thumbnail = metadata.artworkUri.orEmpty(),
-        )
-
-    private companion object {
-        /** Monotonic reference for telling a seek apart from ordinary playback advancing. */
-        val PROCESS_START = TimeSource.Monotonic.markNow()
-
-        /**
-         * Metrolist's own hard-sync threshold (`HARD_SYNC_THRESHOLD_MS`). Below it a seek costs
-         * more in stutter than it buys in sync; above it the room is audibly apart.
-         */
-        const val SEEK_TOLERANCE_MS = 750L
-
-        /**
-         * A jump larger than this is a seek rather than playback advancing. Comfortably above the
-         * progress tick interval so ordinary drift never trips it.
-         */
-        const val SEEK_DETECT_MS = 2_500L
-        const val READY_BUFFER_PERCENT = 5
+        }
     }
 }

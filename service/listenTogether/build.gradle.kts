@@ -39,6 +39,7 @@ kotlin {
                 // bytes from @Serializable classes that protoc produces from listentogether.proto,
                 // which is what lets the whole codec live in commonMain — see docs/listen-together.md.
                 implementation(libs.kotlinx.serialization.protobuf)
+                implementation(libs.kotlinx.serialization.json)
                 // Gzip for the envelope's `compressed` flag. java.util.zip is JVM-only; okio ships
                 // GzipSource/GzipSink on every target this module builds for.
                 implementation(libs.okio)

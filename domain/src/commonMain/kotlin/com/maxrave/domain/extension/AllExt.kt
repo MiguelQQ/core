@@ -50,16 +50,18 @@ fun GenericMediaItem.toSongEntity(): SongEntity =
     SongEntity(
         videoId = this.mediaId,
         albumId = null,
-        albumName = this.metadata.albumTitle.toString(),
+        // `null.toString()` is the text "null": an item without an artist used to become an artist
+        // called "null", which lyrics providers then searched for. Absent stays absent.
+        albumName = this.metadata.albumTitle?.takeIf { it.isNotBlank() },
         artistId = null,
-        artistName = listOf(this.metadata.artist.toString()),
+        artistName = this.metadata.artist?.takeIf { it.isNotBlank() }?.let { listOf(it) },
         duration = "",
         durationSeconds = 0,
         isAvailable = true,
         isExplicit = false,
         likeStatus = "INDIFFERENT",
         thumbnails = this.metadata.artworkUri.toString(),
-        title = this.metadata.title.toString(),
+        title = this.metadata.title.orEmpty(),
         videoType = "",
         category = "",
         resultType = "",

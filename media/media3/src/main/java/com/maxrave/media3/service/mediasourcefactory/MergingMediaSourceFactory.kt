@@ -57,6 +57,11 @@ internal class MergingMediaSourceFactory(
                     .build(),
             )
         }
+        // JAM still uses the normal resolving data source. SONG needs no video preference read
+        // (createMediaSource can run on Main), and no special server audio path.
+        if (mediaItem.mediaMetadata.description != MERGING_DATA_TYPE.VIDEO) {
+            return defaultMediaSourceFactory.createMediaSource(mediaItem)
+        }
         Logger.w("Merging Media Source", mediaItem.mediaMetadata.description.toString())
         val getVideo = runBlocking(Dispatchers.IO) { dataStoreManager.watchVideoInsteadOfPlayingAudio.first() } == DataStoreManager.Values.TRUE
         Logger.w("Merging Media Source", getVideo.toString())
