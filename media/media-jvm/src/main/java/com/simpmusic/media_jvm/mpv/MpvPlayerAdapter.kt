@@ -47,6 +47,7 @@ import java.io.File
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
@@ -132,7 +133,8 @@ class MpvPlayerAdapter(
     }
 
     // ========== State Management ==========
-    private val listeners = mutableListOf<MediaPlayerListener>()
+    // Snapshot iteration: add/remove/clear run off the Desktop-Player-Thread that walks this list.
+    private val listeners = CopyOnWriteArrayList<MediaPlayerListener>()
 
     @Volatile
     private var currentPlayer: MpvPlayer? = null
