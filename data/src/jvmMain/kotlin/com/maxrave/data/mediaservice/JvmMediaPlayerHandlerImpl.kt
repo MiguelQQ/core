@@ -137,6 +137,10 @@ private const val SMOOTH_MAX_LEAD_MS = 600L
 // immediately instead of easing towards it.
 private const val SMOOTH_SNAP_MS = 1_000L
 
+// Windows SMTC / Linux MPRIS go through NPYC. JMTC does not need a position on every 50 ms
+// tick; once a second keeps the flyout moving without flooding the native bridge.
+private const val SYSTEM_MEDIA_POSITION_INTERVAL_NS = 1_000_000_000L
+
 class JvmMediaPlayerHandlerImpl(
     private val dataStoreManager: DataStoreManager,
     private val songRepository: SongRepository,
@@ -227,6 +231,14 @@ class JvmMediaPlayerHandlerImpl(
         } else {
             null
         }
+
+    /** Last duration successfully handed to NPYC. Same value is not sent again. */
+    @Volatile
+    private var lastSystemMediaDurationMs: Long = -1L
+
+    /** Monotonic timestamp of the last position push. Zero means none yet. */
+    @Volatile
+    private var lastSystemMediaPositionPushNanos: Long = 0L
 
     // macOS Media Integration (Now Playing Center + Remote Command Center)
     private val macOSMediaIntegration: MacOSMediaIntegration? by lazy {
@@ -772,79 +784,98 @@ class JvmMediaPlayerHandlerImpl(
         getDataOfNowPlayingTrackStateJob =
             coroutineScope.launch {
                 Logger.w(TAG, "getDataOfNowPlayingState: $videoId")
-                songRepository.getSongById(videoId).cancellable().singleOrNull().let { songEntity ->
-                    // Both branches resolve to an entity that already carries the up-scaled
-                    // thumbnail, so the now-playing state, Discord RPC and the OS media panels
-                    // get the high-res URL immediately instead of waiting for the DB flow to
-                    // re-emit. The regex matches any "=w<n>" / "-h<n>" size segment, not just
-                    // w120, so 60/226/etc. are up-scaled too (parity with Android).
-                    val song: SongEntity =
-                        if (songEntity != null) {
-                            _controlState.update { it.copy(isLiked = songEntity.liked) }
-                            val thumbUrl =
-                                Regex("=w\\d+-h\\d+").replace(
-                                    track?.thumbnails?.lastOrNull()?.url
-                                        ?: songEntity.thumbnails
-                                        ?: "http://i.ytimg.com/vi/${songEntity.videoId}/maxresdefault.jpg",
-                                    "=w544-h544",
-                                )
-                            if (songEntity.thumbnails != thumbUrl) {
-                                songRepository.updateThumbnailsSongEntity(thumbUrl, songEntity.videoId).singleOrNull()?.let {
-                                    Logger.d(TAG, "getDataOfNowPlayingState: Updated thumbs $it")
-                                }
-                            }
-                            // Rows written before the parsers carried YouTube's real MUSIC_VIDEO_TYPE_*
-                            // hold an invented label ("Song", "video", a view count). They are corrected
-                            // here as the user plays them rather than by a migration. normalize() drops
-                            // anything that is not a real type, so an unknown never overwrites a known one.
-                            MusicVideoType.normalize(track?.videoType)?.let { freshVideoType ->
-                                if (songEntity.videoType != freshVideoType) {
-                                    songRepository.updateVideoTypeSongEntity(freshVideoType, songEntity.videoId).singleOrNull()?.let {
-                                        Logger.d(TAG, "getDataOfNowPlayingState: Updated videoType $it")
+                // A database failure used to leave SMTC/MPRIS with the previous track (or nothing).
+                // The media item already carries title, artist and artwork, so the flyout can
+                // still update while the catalog lookup is down.
+                var publishedSystemNowPlaying = false
+                try {
+                    songRepository.getSongById(videoId).cancellable().singleOrNull().let { songEntity ->
+                        // Both branches resolve to an entity that already carries the up-scaled
+                        // thumbnail, so the now-playing state, Discord RPC and the OS media panels
+                        // get the high-res URL immediately instead of waiting for the DB flow to
+                        // re-emit. The regex matches any "=w<n>" / "-h<n>" size segment, not just
+                        // w120, so 60/226/etc. are up-scaled too (parity with Android).
+                        val song: SongEntity =
+                            if (songEntity != null) {
+                                _controlState.update { it.copy(isLiked = songEntity.liked) }
+                                val thumbUrl =
+                                    Regex("=w\\d+-h\\d+").replace(
+                                        track?.thumbnails?.lastOrNull()?.url
+                                            ?: songEntity.thumbnails
+                                            ?: "http://i.ytimg.com/vi/${songEntity.videoId}/maxresdefault.jpg",
+                                        "=w544-h544",
+                                    )
+                                if (songEntity.thumbnails != thumbUrl) {
+                                    songRepository.updateThumbnailsSongEntity(thumbUrl, songEntity.videoId).singleOrNull()?.let {
+                                        Logger.d(TAG, "getDataOfNowPlayingState: Updated thumbs $it")
                                     }
                                 }
-                            }
-                            songRepository.updateSongInLibrary(now(), songEntity.videoId).singleOrNull().let {
-                                Logger.d(TAG, "getDataOfNowPlayingState: $it")
-                            }
-                            songRepository.updateListenCount(songEntity.videoId)
-                            songEntity.copy(thumbnails = thumbUrl)
-                        } else {
-                            _controlState.update { it.copy(isLiked = false) }
-                            val thumbUrl =
-                                Regex("=w\\d+-h\\d+").replace(
-                                    track?.thumbnails?.lastOrNull()?.url
-                                        ?: "http://i.ytimg.com/vi/${track?.videoId}/maxresdefault.jpg",
-                                    "=w544-h544",
-                                )
-                            val newSong =
-                                (track?.toSongEntity() ?: mediaItem.toSongEntity()).copy(
-                                    thumbnails = thumbUrl,
-                                )
-                            songRepository
-                                .insertSong(newSong)
-                                .singleOrNull()
-                                ?.let {
+                                // Rows written before the parsers carried YouTube's real MUSIC_VIDEO_TYPE_*
+                                // hold an invented label ("Song", "video", a view count). They are corrected
+                                // here as the user plays them rather than by a migration. normalize() drops
+                                // anything that is not a real type, so an unknown never overwrites a known one.
+                                MusicVideoType.normalize(track?.videoType)?.let { freshVideoType ->
+                                    if (songEntity.videoType != freshVideoType) {
+                                        songRepository.updateVideoTypeSongEntity(freshVideoType, songEntity.videoId).singleOrNull()?.let {
+                                            Logger.d(TAG, "getDataOfNowPlayingState: Updated videoType $it")
+                                        }
+                                    }
+                                }
+                                songRepository.updateSongInLibrary(now(), songEntity.videoId).singleOrNull().let {
                                     Logger.d(TAG, "getDataOfNowPlayingState: $it")
                                 }
-                            newSong
+                                songRepository.updateListenCount(songEntity.videoId)
+                                songEntity.copy(thumbnails = thumbUrl)
+                            } else {
+                                _controlState.update { it.copy(isLiked = false) }
+                                val thumbUrl =
+                                    Regex("=w\\d+-h\\d+").replace(
+                                        track?.thumbnails?.lastOrNull()?.url
+                                            ?: "http://i.ytimg.com/vi/${track?.videoId}/maxresdefault.jpg",
+                                        "=w544-h544",
+                                    )
+                                val newSong =
+                                    (track?.toSongEntity() ?: mediaItem.toSongEntity()).copy(
+                                        thumbnails = thumbUrl,
+                                    )
+                                songRepository
+                                    .insertSong(newSong)
+                                    .singleOrNull()
+                                    ?.let {
+                                        Logger.d(TAG, "getDataOfNowPlayingState: $it")
+                                    }
+                                newSong
+                            }
+                        _nowPlayingState.update {
+                            it.copy(
+                                songEntity = song,
+                            )
                         }
-                    _nowPlayingState.update {
-                        it.copy(
-                            songEntity = song,
+                        updateDiscordRpc(song)
+                        // Launched separately: "now playing" is a network round trip, and this job
+                        // still has the rest of the track state to publish.
+                        coroutineScope.launch { lastfmScrobbler.onTrackStarted(song) }
+                        pushSystemNowPlaying(
+                            song.title,
+                            song.artistName?.joinToString(", ") ?: "",
+                            song.albumName ?: "",
+                            song.thumbnails,
+                        )
+                        publishedSystemNowPlaying = true
+                        updateMacOSNowPlayingInfo(song)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Logger.e(TAG, "getDataOfNowPlayingState: ${error.message}")
+                    if (!publishedSystemNowPlaying) {
+                        pushSystemNowPlaying(
+                            mediaItem.metadata.title.orEmpty(),
+                            mediaItem.metadata.artist.orEmpty(),
+                            mediaItem.metadata.albumTitle.orEmpty(),
+                            mediaItem.metadata.artworkUri,
                         )
                     }
-                    updateDiscordRpc(song)
-                    // Launched separately: "now playing" is a network round trip, and this job
-                    // still has the rest of the track state to publish.
-                    coroutineScope.launch { lastfmScrobbler.onTrackStarted(song) }
-                    nypc?.setNowPlaying(
-                        song.title,
-                        song.artistName?.joinToString(", ") ?: "",
-                        song.albumName ?: "",
-                        song.thumbnails,
-                    )
-                    updateMacOSNowPlayingInfo(song)
                 }
                 songEntityJob?.cancel()
                 songEntityJob =
@@ -1002,11 +1033,16 @@ class JvmMediaPlayerHandlerImpl(
                 isPreviousAvailable = player.hasPreviousMediaItem(),
             )
         coroutineScope.launch {
-            nypc?.setButtonEnabled(
-                isPlaying = controlState.value.isPlaying,
-                canGoNext = controlState.value.isNextAvailable,
-                canGoPrevious = controlState.value.isPreviousAvailable,
-            )
+            runCatching {
+                nypc?.setButtonEnabled(
+                    isPlaying = controlState.value.isPlaying,
+                    canGoNext = controlState.value.isNextAvailable,
+                    canGoPrevious = controlState.value.isPreviousAvailable,
+                )
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                Logger.w(TAG, "setButtonEnabled failed: ${error.message}")
+            }
         }
         updateMacOSCommandsEnabled()
     }
@@ -1103,6 +1139,8 @@ class JvmMediaPlayerHandlerImpl(
                     delay(tickIntervalMs)
                     _simpleMediaState.value = SimpleMediaState.Progress(smoothedPosition(player.currentPosition))
                     updateMacOSElapsedTime()
+                    updateSystemMediaDuration()
+                    updateSystemMediaPosition()
                     sinceLastPositionSaveMs += tickIntervalMs
                     if (sinceLastPositionSaveMs >= positionPersistIntervalMs) {
                         sinceLastPositionSaveMs = 0
@@ -1142,6 +1180,7 @@ class JvmMediaPlayerHandlerImpl(
                             )
                         }
                     }
+                    updateSystemMediaDuration()
                 }
             }
     }
@@ -3002,6 +3041,7 @@ class JvmMediaPlayerHandlerImpl(
             PlayerConstants.STATE_READY -> {
                 Logger.d(TAG, "onPlaybackStateChanged: Ready")
                 _simpleMediaState.value = SimpleMediaState.Ready(player.duration)
+                updateSystemMediaDuration()
             }
 
             else -> {
@@ -3027,6 +3067,8 @@ class JvmMediaPlayerHandlerImpl(
             }
         }
         updateNextPreviousTrackAvailability()
+        updateSystemMediaDuration()
+        updateSystemMediaPosition(force = true)
         updateMacOSPlaybackState(isPlaying)
     }
 
@@ -3037,6 +3079,7 @@ class JvmMediaPlayerHandlerImpl(
         if (!player.isPlaying) {
             _simpleMediaState.value = SimpleMediaState.Progress(positionMs)
         }
+        updateSystemMediaPosition(force = true)
     }
 
     override fun onMediaItemTransition(
@@ -3083,6 +3126,11 @@ class JvmMediaPlayerHandlerImpl(
             }
         }
         updateNextPreviousTrackAvailability()
+        // New track: duration may match the previous one numerically, and the flyout must
+        // restart at 0 even when the progress loop is between its one-second pushes.
+        lastSystemMediaDurationMs = -1L
+        updateSystemMediaDuration()
+        updateSystemMediaPosition(force = true, positionMs = 0L)
         updateNotification()
         if (player.currentMediaItemIndex == 0) {
             resetCrossfade()
@@ -3511,6 +3559,67 @@ class JvmMediaPlayerHandlerImpl(
      */
     private fun updateMacOSElapsedTime() {
         macOSMediaIntegration?.updateElapsedTime(player.currentPosition / 1000.0, 1.0)
+    }
+
+    /**
+     * Pushes [player.duration] to Windows SMTC / Linux MPRIS when it is known and changed.
+     * NPYC's setter is suspend; a native failure stays inside this handler scope.
+     */
+    private fun updateSystemMediaDuration() {
+        val center = nypc ?: return
+        val duration = player.duration
+        if (duration <= 0L || duration == lastSystemMediaDurationMs) return
+        lastSystemMediaDurationMs = duration
+        coroutineScope.launch {
+            runCatching { center.setDuration(duration) }
+                .onFailure { error ->
+                    if (lastSystemMediaDurationMs == duration) lastSystemMediaDurationMs = -1L
+                    if (error is CancellationException) throw error
+                    Logger.w(TAG, "setDuration failed: ${error.message}")
+                }
+        }
+    }
+
+    /**
+     * Pushes the playback position to NPYC. The progress loop calls this every tick; only one
+     * push per second goes out unless [force] is set (seek, play/pause, track change).
+     * [positionMs] overrides the player position — a track change reports 0 immediately.
+     */
+    private fun updateSystemMediaPosition(
+        force: Boolean = false,
+        positionMs: Long? = null,
+    ) {
+        val center = nypc ?: return
+        val now = System.nanoTime()
+        if (!force &&
+            lastSystemMediaPositionPushNanos != 0L &&
+            now - lastSystemMediaPositionPushNanos < SYSTEM_MEDIA_POSITION_INTERVAL_NS
+        ) {
+            return
+        }
+        lastSystemMediaPositionPushNanos = now
+        val position = (positionMs ?: player.currentPosition).coerceAtLeast(0L)
+        coroutineScope.launch {
+            runCatching { center.setCurrentPosition(position) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    Logger.w(TAG, "setCurrentPosition failed: ${error.message}")
+                }
+        }
+    }
+
+    private suspend fun pushSystemNowPlaying(
+        title: String,
+        artist: String,
+        album: String,
+        artwork: String?,
+    ) {
+        val center = nypc ?: return
+        runCatching { center.setNowPlaying(title, artist, album, artwork) }
+            .onFailure { error ->
+                if (error is CancellationException) throw error
+                Logger.w(TAG, "setNowPlaying failed: ${error.message}")
+            }
     }
 
     /**
